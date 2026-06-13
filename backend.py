@@ -902,7 +902,6 @@ def _build_report_text(utterance: str) -> str:
     if summary:
         L.append(f"▶ 개요: {summary}")
     L.append(f"▶ 조치사항: {_DEFAULT_ACTION}")
-    L.append("")
 
     # 기상 — 가장 가까운 1개로 통합 (풍향·풍속·파고·수온은 최근접 부이, 기온은 최근접 AWS)
     if wx:
