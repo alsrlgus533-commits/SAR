@@ -928,7 +928,7 @@ def _build_report_text(utterance: str) -> str:
         detail = f"(성인 {mtis['대인']}·소아 {mtis['소인']}·유아 {mtis['유아']})"
         tmp = f", 임시승선자 {mtis['임시승선자']}명" if mtis.get("임시승선자") else ""
         L.append(f"▶ 승선: 여객 {mtis['여객']}명{detail}, 선원 {mtis['승무원']}명{tmp} "
-                 f"(실승선 계 {mtis['실제승선인원']}명) [MTIS 출항전점검표]")
+                 f"(실승선 계 {mtis['실제승선인원']}명)")
         cargo, veh = mtis.get("화물적재중량", ""), mtis.get("차량", 0)
         cargo_txt = " · ".join(x for x in (
             f"적재 {cargo} M/T" if cargo else "",
