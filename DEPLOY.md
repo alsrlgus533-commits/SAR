@@ -24,10 +24,11 @@ git push -u origin main
 3. 프레임워크: **Python** 선택 (Python 3.12 권장)
 4. **시작 명령어(Start Command)**:
    ```
-   gunicorn backend:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 120
+   gunicorn backend:app --bind 0.0.0.0:8000 --workers 1 --threads 8 --timeout 120
    ```
    (Procfile에도 동일 명령이 있어 자동 인식될 수 있음)
-5. **포트**: `$PORT` 자동 주입 사용. 포트 입력란이 따로 있으면 `8000` 지정 후 명령어의 `$PORT`를 `8000`으로 고정.
+   > ⚠️ Cloudtype는 `$PORT`를 자동 주입하지 않는다 → `$PORT`로 두면 `'' is not a valid port number` 오류로 크래시. **포트를 8000으로 고정**할 것.
+5. **포트**: 서비스 설정의 **포트 = `8000`** (위 bind와 동일하게).
 6. **환경변수(Variables)** 등록 — `.env` 내용을 그대로:
    - `KOMSA_KEY` (필수)
    - `KMA_KEY` (필수)
