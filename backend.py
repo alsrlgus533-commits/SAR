@@ -829,6 +829,34 @@ def _extract_latlon(text: str):
 # 1차 보고서 기본 조치사항 (웹 보고서와 동일한 자동완성 문구)
 _DEFAULT_ACTION = "해경 및 해사안전 감독관 보고, 여객 안내방송 및 승객 구명조끼 착용 후 선내 대기 중"
 
+# 기준점 목록 (이름, 위도, 경도) — 사고위치의 상대 방위·거리(마일) 표기용
+_REF_POINTS = [
+    ("추자도등대", 33 + 57.5 / 60, 126 + 18.1 / 60),
+    ("제주항북방파제", 33 + 31.5 / 60, 126 + 32.7 / 60),
+    ("한림항방파제", 33 + 25.0 / 60, 126 + 15.5 / 60),
+]
+_DIR8 = ["북", "북동", "동", "남동", "남", "남서", "서", "북서"]
+
+
+def _rel_position(lat, lon) -> str:
+    """사고 좌표 → 가장 가까운 기준점 기준 '○○ ○쪽 N마일'. 좌표 없으면 ''."""
+    if lat is None or lon is None:
+        return ""
+    from math import radians, sin, cos, asin, sqrt, atan2, pi
+    best = None
+    for name, rlat, rlon in _REF_POINTS:
+        dlat, dlon = radians(lat - rlat), radians(lon - rlon)
+        a = sin(dlat / 2) ** 2 + cos(radians(rlat)) * cos(radians(lat)) * sin(dlon / 2) ** 2
+        dist = 2 * 3440.065 * asin(sqrt(a))
+        y = sin(dlon) * cos(radians(lat))
+        x = cos(radians(rlat)) * sin(radians(lat)) - sin(radians(rlat)) * cos(radians(lat)) * cos(dlon)
+        brg = (atan2(y, x) * 180 / pi + 360) % 360
+        if best is None or dist < best[1]:
+            best = (name, dist, brg)
+    name, dist, brg = best
+    dist_txt = f"{dist:.1f}" if dist < 10 else str(round(dist))
+    return f"{name} {_DIR8[round(brg / 45) % 8]}쪽 {dist_txt}마일"
+
 
 def _build_report_text(utterance: str) -> str:
     """사고 자유텍스트 → 1차(속보) 보고서 텍스트."""
@@ -864,6 +892,18 @@ def _build_report_text(utterance: str) -> str:
 
     kst = timezone(timedelta(hours=9))
     now = datetime.now(kst).strftime("%Y-%m-%d %H:%M")
+
+    # 기상 줄 (위치 바로 아래에 배치) — 가장 가까운 1개로 통합 (파고·수온은 부이, 기온은 인근 AWS)
+    if wx:
+        parts = [f"풍향 {wx.get('풍향')}", f"풍속 {wx.get('풍속')}",
+                 f"파고 {wx.get('파고')}", f"수온 {wx.get('수온')}"]
+        a = wx.get("AWS")
+        if a and a.get("기온"):
+            parts.append(f"기온 {a.get('기온')}")
+        weather_line = f"▶ 기상: {wx.get('지점','')} " + ", ".join(parts)
+    else:
+        weather_line = "▶ 기상: 위치 정보가 없어 해상관측을 특정하지 못했습니다"
+
     L = ["🚨 해양사고 1차(속보) — 자동작성", ""]
 
     # 선박 제원
@@ -876,8 +916,12 @@ def _build_report_text(utterance: str) -> str:
     elif ship:
         L.append(f"▶ 선박: {ship}")
     L.append(f"▶ 발생: {now}")
+
+    # 위치 (+ 기준점 상대위치) → 바로 아래에 기상
     if loc:
-        L.append(f"▶ 위치: {loc}")
+        relpos = _rel_position(lat, lon)
+        L.append(f"▶ 위치: {loc}" + (f" ({relpos})" if relpos else ""))
+    L.append(weather_line)
 
     # 승선·화물 — MTIS 출항전 점검표(실제) 우선, 없으면 보고자 입력값
     if mtis:
@@ -902,17 +946,6 @@ def _build_report_text(utterance: str) -> str:
     if summary:
         L.append(f"▶ 개요: {summary}")
     L.append(f"▶ 조치사항: {_DEFAULT_ACTION}")
-
-    # 기상 — 가장 가까운 1개로 통합 (풍향·풍속·파고·수온은 최근접 부이, 기온은 최근접 AWS)
-    if wx:
-        parts = [f"풍향 {wx.get('풍향')}", f"풍속 {wx.get('풍속')}",
-                 f"파고 {wx.get('파고')}", f"수온 {wx.get('수온')}"]
-        a = wx.get("AWS")
-        if a and a.get("기온"):
-            parts.append(f"기온 {a.get('기온')}")
-        L.append(f"▶ 기상: {wx.get('지점','')} " + ", ".join(parts))
-    else:
-        L.append("▶ 기상: 위치 정보가 없어 해상관측을 특정하지 못했습니다")
 
     if route_info:
         rr = " · ".join(x for x in (
