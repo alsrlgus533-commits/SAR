@@ -587,34 +587,24 @@ def _mtis_post(path: str, payload: dict) -> dict:
     return json.loads(raw)
 
 
-@app.get("/predep")
-def predep():
-    cd = request.args.get("psnshpCd", "").strip()
-    nm = request.args.get("name", "").strip()
-    de = request.args.get("date", "").strip()
-    tm = request.args.get("time", "").strip()
-    if not cd:
-        return jsonify({"error": "psnshpCd(선박코드)가 필요합니다"}), 400
-
-    try:
-        if tm:
-            # 특정 항차 지정(출항일+시간) → 상세 조회
-            de = de or datetime.now(timezone(timedelta(hours=9))).strftime("%Y%m%d")
-            data = _mtis_post(
-                "detailFerryPreDepCkForMoTraffic",
-                {"psnshpCd": cd, "psnshpNm": nm, "sloffDe": de, "sloffTime": tm.zfill(4)},
-            )
-        else:
-            # 시간 미지정 → 그 선박의 '가장 최근' 출항전 점검표 (작성 시각 기준 최신)
-            data = _mtis_post(
-                "selectQrForSfcstDeInfo", {"psnshpCd": cd, "psnshpNm": "", "shipNo": ""}
-            )
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 502
+def _predep_lookup(cd: str, name: str = "", de: str = "", tm: str = ""):
+    """MTIS 출항전 점검표(실제 승선/화물) 조회. dict 반환, 없으면 None, 오류 시 예외 전파."""
+    if tm:
+        # 특정 항차 지정(출항일+시간) → 상세 조회
+        de = de or datetime.now(timezone(timedelta(hours=9))).strftime("%Y%m%d")
+        data = _mtis_post(
+            "detailFerryPreDepCkForMoTraffic",
+            {"psnshpCd": cd, "psnshpNm": name, "sloffDe": de, "sloffTime": tm.zfill(4)},
+        )
+    else:
+        # 시간 미지정 → 그 선박의 '가장 최근' 출항전 점검표 (작성 시각 기준 최신)
+        data = _mtis_post(
+            "selectQrForSfcstDeInfo", {"psnshpCd": cd, "psnshpNm": "", "shipNo": ""}
+        )
 
     o = (data or {}).get("psnshpSloffBeforeSfcst") or {}
     if not o:
-        return jsonify({"error": "출항전 점검표를 찾지 못했습니다(선박코드 확인)"}), 404
+        return None
 
     def num(key):
         try:
@@ -623,23 +613,40 @@ def predep():
             return 0
 
     pax = num("pasngrAdultHeadcnt") + num("pasngrSmPersonHeadcnt") + num("pasngrInfantHeadcnt")
-    return jsonify(
-        {
-            "여객": pax,
-            "대인": num("pasngrAdultHeadcnt"),
-            "소인": num("pasngrSmPersonHeadcnt"),
-            "유아": num("pasngrInfantHeadcnt"),
-            "승무원": num("realCrewHeadcnt"),
-            "임시승선자": num("realTmpEmbrkHeadcnt"),
-            "실제승선인원": num("realEmbrkPrsnCo"),
-            "항로": o.get("lcnsSeawyNm", ""),
-            "선박번호": o.get("shipNo", ""),
-            "출항일": str(o.get("sloffDe", "")),
-            "출항시간": str(o.get("sloffTime", "")),
-            "화물적재중량": str(o.get("realFrghtLoadngWt", "")),
-            "차량": num("vhcleFrghtCo"),
-        }
-    )
+    return {
+        "여객": pax,
+        "대인": num("pasngrAdultHeadcnt"),
+        "소인": num("pasngrSmPersonHeadcnt"),
+        "유아": num("pasngrInfantHeadcnt"),
+        "승무원": num("realCrewHeadcnt"),
+        "임시승선자": num("realTmpEmbrkHeadcnt"),
+        "실제승선인원": num("realEmbrkPrsnCo"),
+        "항로": o.get("lcnsSeawyNm", ""),
+        "선박번호": o.get("shipNo", ""),
+        "출항일": str(o.get("sloffDe", "")),
+        "출항시간": str(o.get("sloffTime", "")),
+        "화물적재중량": str(o.get("realFrghtLoadngWt", "")),
+        "차량": num("vhcleFrghtCo"),
+    }
+
+
+@app.get("/predep")
+def predep():
+    cd = request.args.get("psnshpCd", "").strip()
+    if not cd:
+        return jsonify({"error": "psnshpCd(선박코드)가 필요합니다"}), 400
+    try:
+        d = _predep_lookup(
+            cd,
+            request.args.get("name", "").strip(),
+            request.args.get("date", "").strip(),
+            request.args.get("time", "").strip(),
+        )
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
+    if d is None:
+        return jsonify({"error": "출항전 점검표를 찾지 못했습니다(선박코드 확인)"}), 404
+    return jsonify(d)
 
 
 # ── /parse ──────────────────────────────────────────
@@ -819,6 +826,10 @@ def _extract_latlon(text: str):
 # 사고 자유텍스트 → 파싱·제원·기상/AWS·항로를 종합한 1차 속보를 자동 작성.
 # 카카오 5초 제한을 넘기므로 콜백(useCallback)으로 즉시 접수 응답 후 결과를 콜백 URL로 전송.
 
+# 1차 보고서 기본 조치사항 (웹 보고서와 동일한 자동완성 문구)
+_DEFAULT_ACTION = "해경 및 해사안전 감독관 보고, 여객 안내방송 및 승객 구명조끼 착용 후 선내 대기 중"
+
+
 def _build_report_text(utterance: str) -> str:
     """사고 자유텍스트 → 1차(속보) 보고서 텍스트."""
     parsed = _parse_nl(utterance)
@@ -828,7 +839,7 @@ def _build_report_text(utterance: str) -> str:
     crew = str(parsed.get("승무원") or "").strip()
     summary = str(parsed.get("사고개요") or "").strip()
 
-    vessel = route_info = None
+    vessel = route_info = mtis = None
     if ship:
         try:
             vessel = _vessel_lookup(ship)
@@ -838,6 +849,13 @@ def _build_report_text(utterance: str) -> str:
             route_info = _route_lookup(ship)
         except Exception:
             route_info = None
+        # MTIS 출항전 점검표 — 실제 승선인원·화물 (KOMSA 선박코드 필요)
+        cd = (vessel or {}).get("선박코드", "")
+        if cd:
+            try:
+                mtis = _predep_lookup(cd)
+            except Exception:
+                mtis = None
 
     lat, lon = _extract_latlon(loc)
     wx = _weather_lookup(loc, "" if lat is None else str(lat), "" if lon is None else str(lon))
@@ -847,6 +865,8 @@ def _build_report_text(utterance: str) -> str:
     kst = timezone(timedelta(hours=9))
     now = datetime.now(kst).strftime("%Y-%m-%d %H:%M")
     L = ["🚨 해양사고 1차(속보) — 자동작성", ""]
+
+    # 선박 제원
     if vessel:
         spec = " · ".join(x for x in (
             vessel.get("선종"), vessel.get("총톤수"),
@@ -858,23 +878,43 @@ def _build_report_text(utterance: str) -> str:
     L.append(f"▶ 발생: {now}")
     if loc:
         L.append(f"▶ 위치: {loc}")
-    try:
-        total = int(pax or 0) + int(crew or 0)
-    except ValueError:
-        total = 0
-    if pax or crew:
+
+    # 승선·화물 — MTIS 출항전 점검표(실제) 우선, 없으면 보고자 입력값
+    if mtis:
+        detail = f"(성인 {mtis['대인']}·소아 {mtis['소인']}·유아 {mtis['유아']})"
+        tmp = f", 임시승선자 {mtis['임시승선자']}명" if mtis.get("임시승선자") else ""
+        L.append(f"▶ 승선(실제): 여객 {mtis['여객']}명{detail}, 선원 {mtis['승무원']}명{tmp} "
+                 f"(실승선 계 {mtis['실제승선인원']}명) [MTIS 출항전점검표]")
+        cargo, veh = mtis.get("화물적재중량", ""), mtis.get("차량", 0)
+        cargo_txt = " · ".join(x for x in (
+            f"실제 적재 {cargo} M/T" if cargo else "",
+            f"차량 {veh}대" if veh else "",
+        ) if x)
+        if cargo_txt:
+            L.append(f"▶ 화물(실제): {cargo_txt}")
+    elif pax or crew:
+        try:
+            total = int(pax or 0) + int(crew or 0)
+        except ValueError:
+            total = 0
         L.append(f"▶ 승선: 여객 {pax or '?'}명, 승무원 {crew or '?'}명" + (f" (계 {total}명)" if total else ""))
+
     if summary:
         L.append(f"▶ 개요: {summary}")
+    L.append(f"▶ 조치사항: {_DEFAULT_ACTION}")
     L.append("")
+
+    # 기상 — 가장 가까운 1개로 통합 (풍향·풍속·파고·수온은 최근접 부이, 기온은 최근접 AWS)
     if wx:
-        L.append(f"[기상] {wx.get('지점','')} 풍향 {wx.get('풍향')}, 풍속 {wx.get('풍속')}, "
-                 f"파고 {wx.get('파고')}, 수온 {wx.get('수온')}")
+        parts = [f"풍향 {wx.get('풍향')}", f"풍속 {wx.get('풍속')}",
+                 f"파고 {wx.get('파고')}", f"수온 {wx.get('수온')}"]
         a = wx.get("AWS")
-        if a:
-            L.append(f"[인근 AWS] {a.get('지점')} 풍향 {a.get('풍향')}, 풍속 {a.get('풍속')}, 기온 {a.get('기온')}")
+        if a and a.get("기온"):
+            parts.append(f"기온 {a.get('기온')}")
+        L.append(f"[기상] {wx.get('지점','')} " + ", ".join(parts))
     else:
         L.append("[기상] 위치 정보가 없어 해상관측을 특정하지 못했습니다")
+
     if route_info:
         rr = " · ".join(x for x in (
             f"운항 {route_info['운항항로']}" if route_info.get("운항항로") else "",
