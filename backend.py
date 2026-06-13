@@ -904,9 +904,10 @@ def _kakao_callback(callback_url: str, utterance: str):
             callback_url, data=payload,
             headers={"Content-Type": "application/json"}, method="POST",
         )
-        urllib.request.urlopen(req, timeout=25).read()
-    except Exception:
-        pass
+        resp = urllib.request.urlopen(req, timeout=25)
+        print(f"[kakao] 콜백 전송 성공 status={resp.status} url={callback_url}", flush=True)
+    except Exception as exc:
+        print(f"[kakao] 콜백 전송 실패: {exc} url={callback_url}", flush=True)
 
 
 @app.post("/kakao")
@@ -915,6 +916,7 @@ def kakao_skill():
     ureq = body.get("userRequest") or {}
     utterance = str(ureq.get("utterance") or "").strip()
     callback_url = ureq.get("callbackUrl")
+    print(f"[kakao] 요청 수신 utterance={utterance!r} callbackUrl={'있음' if callback_url else '없음(콜백 미전달)'}", flush=True)
     if not utterance:
         return jsonify(_kakao_text(
             "사고 내용을 한 문장으로 입력해 주세요.\n"
