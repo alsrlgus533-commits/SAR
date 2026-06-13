@@ -44,6 +44,17 @@ app = Flask(__name__)
 CORS(app)
 
 
+@app.get("/")
+def index():
+    """헬스체크 / 안내 — 루트 접속 시 404 대신 상태 표시."""
+    return jsonify({
+        "service": "해양사고 신속보고 백엔드",
+        "status": "ok",
+        "endpoints": ["/vessel", "/route", "/weather", "/predep", "/parse", "/kakao"],
+        "카카오_스킬_URL": "/kakao (POST)",
+    })
+
+
 # ── 내부 유틸 ──────────────────────────────────────────
 
 def http_get(url: str, as_json: bool = False, timeout: int = 15):
