@@ -1,0 +1,4 @@
+flask>=3.0
+flask-cors>=4.0
+python-dotenv>=1.0
+gunicorn>=21.0   # 클라우드(Linux) 운영용 WSGI 서버 — 로컬 Windows는 python backend.py 그대로

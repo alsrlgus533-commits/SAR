@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(npm *)",
+      "PowerShell(cd D:\\\\SAR; Start-Process python -ArgumentList \"proxy.py\" -WindowStyle Minimized; Start-Sleep -Milliseconds 800; $proc = Get-Process python -ErrorAction SilentlyContinue | Sort-Object StartTime -Descending | Select-Object -First 1; \"proxy.py PID: $\\($proc.Id\\)\")",
+      "PowerShell(Start-Sleep -Seconds 3; $r = try { Invoke-WebRequest http://localhost:5173 -TimeoutSec 5 -UseBasicParsing; \"OK\" } catch { $_.Exception.Message }; \"5173: $r\")",
+      "PowerShell($r = try { Invoke-WebRequest \"http://localhost:8000/fetch?url=http%3A%2F%2Ftest\" -TimeoutSec 3 -UseBasicParsing; \"OK\" } catch { $_.Exception.Message }; \"8000: $r\")",
+      "PowerShell(where.exe python; Write-Output \"---\"; python -c \"import flask, flask_cors, dotenv; print\\('python deps OK'\\)\" 2>&1; Write-Output \"---node---\"; where.exe npm)",
+      "PowerShell(Start-Process python -ArgumentList \"backend.py\" -WorkingDirectory \"D:\\\\SAR\" -WindowStyle Minimized; Write-Output \"backend started\")",
+      "PowerShell(Start-Process npm -ArgumentList \"run\",\"dev\" -WorkingDirectory \"D:\\\\SAR\" -WindowStyle Minimized; Write-Output \"frontend started\")",
+      "PowerShell(npm run *)",
+      "PowerShell($b = [System.IO.File]::ReadAllBytes\\(\"D:\\\\SAR\\\\launch.bat\"\\); \"Length: $\\($b.Length\\)\"; \"First bytes: \" + \\($b[0..3] -join ','\\); \"BOM EF BB BF? \" + \\($b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF\\))"
+    ]
+  }
+}
