@@ -16,3 +16,6 @@ build/
 .vscode/
 .idea/
 *.swp
+
+# 로컬 도구 설정 (Claude Code 등)
+.claude/
