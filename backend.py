@@ -883,15 +883,15 @@ def _build_report_text(utterance: str) -> str:
     if mtis:
         detail = f"(성인 {mtis['대인']}·소아 {mtis['소인']}·유아 {mtis['유아']})"
         tmp = f", 임시승선자 {mtis['임시승선자']}명" if mtis.get("임시승선자") else ""
-        L.append(f"▶ 승선(실제): 여객 {mtis['여객']}명{detail}, 선원 {mtis['승무원']}명{tmp} "
+        L.append(f"▶ 승선: 여객 {mtis['여객']}명{detail}, 선원 {mtis['승무원']}명{tmp} "
                  f"(실승선 계 {mtis['실제승선인원']}명) [MTIS 출항전점검표]")
         cargo, veh = mtis.get("화물적재중량", ""), mtis.get("차량", 0)
         cargo_txt = " · ".join(x for x in (
-            f"실제 적재 {cargo} M/T" if cargo else "",
+            f"적재 {cargo} M/T" if cargo else "",
             f"차량 {veh}대" if veh else "",
         ) if x)
         if cargo_txt:
-            L.append(f"▶ 화물(실제): {cargo_txt}")
+            L.append(f"▶ 화물: {cargo_txt}")
     elif pax or crew:
         try:
             total = int(pax or 0) + int(crew or 0)
@@ -911,9 +911,9 @@ def _build_report_text(utterance: str) -> str:
         a = wx.get("AWS")
         if a and a.get("기온"):
             parts.append(f"기온 {a.get('기온')}")
-        L.append(f"[기상] {wx.get('지점','')} " + ", ".join(parts))
+        L.append(f"▶ 기상: {wx.get('지점','')} " + ", ".join(parts))
     else:
-        L.append("[기상] 위치 정보가 없어 해상관측을 특정하지 못했습니다")
+        L.append("▶ 기상: 위치 정보가 없어 해상관측을 특정하지 못했습니다")
 
     if route_info:
         rr = " · ".join(x for x in (
@@ -922,7 +922,7 @@ def _build_report_text(utterance: str) -> str:
             f"출발 {route_info['출발시각']}" if route_info.get("출발시각") else "",
         ) if x)
         if rr:
-            L.append(f"[항로] {rr}")
+            L.append(f"▶ 항로: {rr}")
     L.append("")
     L.append("※ 자동 생성 초안 — 운항관리자 확인 후 정식 전파")
     return "\n".join(L)
