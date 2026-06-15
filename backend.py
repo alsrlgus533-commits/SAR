@@ -1251,11 +1251,13 @@ def _build_report_text(utterance: str) -> str:
         L.append(f"▶ 선박: {ship}")
     L.append(f"▶ 발생: {now}")
 
-    # 출항시각 (운항항로 조회의 출발시각, HHMM → HH:MM)
-    dep = str((route_info or {}).get("출발시각") or "").strip()
+    # 출항시각 + 항로(출발-도착) — MTIS 점검표 우선(실제 항차), 없으면 운항항로 조회
+    dep = str((mtis or {}).get("출항시간") or (route_info or {}).get("출발시각") or "").strip()
     if dep:
         dep = f"{dep.zfill(4)[:2]}:{dep.zfill(4)[2:]}" if dep.isdigit() else dep
-        L.append(f"▶ 출항시각: {dep}")
+        route_nm = ((mtis or {}).get("항로") or (route_info or {}).get("운항항로")
+                    or (route_info or {}).get("면허항로") or (vessel or {}).get("항로") or "").strip()
+        L.append(f"▶ 출항시각: {dep}" + (f" ({route_nm})" if route_nm else ""))
 
     # 위치 (+ 기준점 상대위치) → 바로 아래에 기상
     if loc:
