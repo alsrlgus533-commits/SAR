@@ -1251,6 +1251,12 @@ def _build_report_text(utterance: str) -> str:
         L.append(f"▶ 선박: {ship}")
     L.append(f"▶ 발생: {now}")
 
+    # 출항시각 (운항항로 조회의 출발시각, HHMM → HH:MM)
+    dep = str((route_info or {}).get("출발시각") or "").strip()
+    if dep:
+        dep = f"{dep.zfill(4)[:2]}:{dep.zfill(4)[2:]}" if dep.isdigit() else dep
+        L.append(f"▶ 출항시각: {dep}")
+
     # 위치 (+ 기준점 상대위치) → 바로 아래에 기상
     if loc:
         relpos = _rel_position(lat, lon)
