@@ -1285,7 +1285,6 @@ def _build_report_text(utterance: str) -> str:
         rr = " · ".join(x for x in (
             f"운항 {route_info['운항항로']}" if route_info.get("운항항로") else "",
             f"상태 {route_info['운항상태']}" if route_info.get("운항상태") else "",
-            f"출발 {route_info['출발시각']}" if route_info.get("출발시각") else "",
         ) if x)
         if rr:
             L.append(f"▶ 항로: {rr}")
