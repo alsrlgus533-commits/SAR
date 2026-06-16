@@ -1340,14 +1340,55 @@ def _kakao_text(text: str) -> dict:
     return {"version": "2.0", "template": {"outputs": [{"simpleText": {"text": text}}]}}
 
 
-def _kakao_callback(callback_url: str, utterance: str):
+# ── 카카오 세션: 사용자별 직전 보고서 보관(개요 수정·전송용) ──
+_SESSIONS = {}          # user_id -> {"report": str, "mode": None|"await_append"}
+_SESSIONS_MAX = 500
+
+
+def _session_set(uid: str, **kw):
+    s = _SESSIONS.get(uid) or {}
+    s.update(kw)
+    _SESSIONS[uid] = s
+    if len(_SESSIONS) > _SESSIONS_MAX:       # 메모리 보호: 오래된 항목 정리
+        for k in list(_SESSIONS)[:-_SESSIONS_MAX]:
+            _SESSIONS.pop(k, None)
+    return s
+
+
+def _append_summary(report: str, add: str) -> str:
+    """보고서의 '▶ 개요:' 줄 끝에 운항관리자 입력을 덧붙인다."""
+    add = add.strip()
+    if not add:
+        return report
+    if re.search(r"^▶ 개요:", report, re.M):
+        return re.sub(r"(^▶ 개요:[^\n]*)", lambda m: m.group(1) + " / " + add,
+                      report, count=1, flags=re.M)
+    return report.replace("▶ 조치사항:", f"▶ 개요: {add}\n▶ 조치사항:", 1)
+
+
+_KAKAO_QUICK = [
+    {"label": "✏️ 개요 추가", "action": "message", "messageText": "개요 추가"},
+    {"label": "📤 관계기관 전송", "action": "message", "messageText": "관계기관 전송"},
+]
+
+
+def _kakao_report(text: str) -> dict:
+    """보고서 simpleText + 하단 바로가기 버튼(개요 추가·전송)."""
+    return {"version": "2.0", "template": {
+        "outputs": [{"simpleText": {"text": text}}],
+        "quickReplies": _KAKAO_QUICK,
+    }}
+
+
+def _kakao_callback(callback_url: str, utterance: str, uid: str = "anon"):
     """백그라운드: 보고서 작성 후 카카오 콜백 URL로 결과 전송."""
     try:
         text = _build_report_text(utterance)
     except Exception as exc:
         text = f"보고서 자동작성 중 오류가 발생했습니다: {exc}"
+    _session_set(uid, report=text, mode=None)
     try:
-        payload = json.dumps(_kakao_text(text), ensure_ascii=False).encode("utf-8")
+        payload = json.dumps(_kakao_report(text), ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(
             callback_url, data=payload,
             headers={"Content-Type": "application/json"}, method="POST",
@@ -1364,14 +1405,40 @@ def kakao_skill():
     ureq = body.get("userRequest") or {}
     utterance = str(ureq.get("utterance") or "").strip()
     callback_url = ureq.get("callbackUrl")
+    uid = ((ureq.get("user") or {}).get("id")) or "anon"
+    sess = _SESSIONS.get(uid) or {}
     print(f"[kakao] 요청 수신 utterance={utterance!r} callbackUrl={'있음' if callback_url else '없음(콜백 미전달)'}", flush=True)
     if not utterance:
         return jsonify(_kakao_text(
             "사고 내용을 한 문장으로 입력해 주세요.\n"
             "예) 섬사랑12호 추자도 북동방 2해리, 여객 28명 승무원 4명, 폐그물 감김"))
-    # 콜백 사용(AI 챗봇 콜백 활성화) → 즉시 접수 응답 후 비동기로 결과 전송
+
+    # ① [개요 추가] 버튼 → 입력 대기 모드
+    if utterance == "개요 추가":
+        if not sess.get("report"):
+            return jsonify(_kakao_text("먼저 사고 내용을 입력해 주세요."))
+        _session_set(uid, mode="await_append")
+        return jsonify(_kakao_text("✏️ 추가할 개요 내용을 입력해 주세요.\n(기존 개요 뒤에 덧붙여집니다)"))
+
+    # ② [관계기관 전송] 버튼 → 전달(공유) 안내
+    if utterance == "관계기관 전송":
+        if not sess.get("report"):
+            return jsonify(_kakao_text("먼저 사고 내용을 입력해 주세요."))
+        return jsonify(_kakao_text(
+            "📤 관계기관 전송 방법\n"
+            "① 위 보고서 메시지를 길게 누르기 → ② [전달] → ③ 관계기관 채팅방 선택\n"
+            "※ 카카오 정책상 자동 발송 대신 전달(공유) 방식으로 보냅니다."))
+
+    # ③ 개요 덧붙이기 입력 모드 → 개요 갱신 후 보고서 재표출
+    if sess.get("mode") == "await_append" and sess.get("report"):
+        new = _append_summary(sess["report"], utterance)
+        _session_set(uid, report=new, mode=None)
+        return jsonify(_kakao_report(new))
+
+    # ④ 새 사고 — 콜백(비동기) 처리
     if callback_url:
-        threading.Thread(target=_kakao_callback, args=(callback_url, utterance), daemon=True).start()
+        _session_set(uid, mode=None)
+        threading.Thread(target=_kakao_callback, args=(callback_url, utterance, uid), daemon=True).start()
         return jsonify({
             "version": "2.0",
             "useCallback": True,
@@ -1379,7 +1446,9 @@ def kakao_skill():
         })
     # 콜백 미설정 폴백: 동기 처리(외부 API 지연 시 5초 초과 가능)
     try:
-        return jsonify(_kakao_text(_build_report_text(utterance)))
+        text = _build_report_text(utterance)
+        _session_set(uid, report=text, mode=None)
+        return jsonify(_kakao_report(text))
     except Exception as exc:
         return jsonify(_kakao_text(f"보고서 자동작성 중 오류가 발생했습니다: {exc}"))
 
