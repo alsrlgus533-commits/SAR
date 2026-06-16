@@ -762,16 +762,35 @@ def _rule_parse(text: str) -> dict:
         summary = "추진기 이물질 걸림으로 자력 항해 불가"
     elif "좌초" in text:
         summary = "좌초 발생"
+    elif "좌주" in text:
+        summary = "좌주 발생"
     elif "충돌" in text:
         summary = "충돌 발생"
     elif "화재" in text:
         summary = "화재 발생"
+    elif "침수" in text:
+        summary = "침수 발생"
+    elif "전복" in text:
+        summary = "전복 발생"
+    elif re.search(r"타기|조타|조향|러더", text):
+        summary = "조타장치(타기) 고장"
+    elif re.search(r"추진기|프로펠러|스크류", text):
+        summary = "추진기 고장으로 자력 항해 불가"
     elif re.search(r"기관|엔진", text):
         summary = "기관 고장으로 자력 항해 불가"
     elif re.search(r"정선|표류", text):
         summary = "자력 항해 불가 (정선·표류)"
+    if not summary:
+        # 사고유형 미인식 → 선박명·좌표를 제거한 입력문을 개요로 사용
+        clean = text
+        if ship:
+            clean = clean.replace(ship, " ")
+        clean = re.sub(r"\d{1,3}[-–]\d{1,3}(?:\.\d+)?\s*[NSEWnsew]?", " ", clean)  # 도-분 좌표
+        clean = re.sub(r"\d{1,3}\.\d{2,}\s*[NSEWnsew]?", " ", clean)              # 십진 좌표
+        clean = re.sub(r"\s+", " ", clean).strip(" ,/")
+        summary = clean or text[:60]
     loc = " / ".join(x for x in (pos, area) if x)
-    return {"선박명": ship, "사고위치": loc, "여객": pax, "승무원": crew, "사고개요": summary or text[:60]}
+    return {"선박명": ship, "사고위치": loc, "여객": pax, "승무원": crew, "사고개요": summary}
 
 
 def _parse_nl(text: str) -> dict:
