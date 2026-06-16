@@ -1919,7 +1919,9 @@ def _compose_report_hwpx(data: dict) -> bytes:
 
     H1, H2 = 16, 12   # 제목 / 항목 글자크기(pt)
     b = HwpxBuilder()
-    b.add_paragraph(f"({data['사고종류']}) 사고 보고", bold=True, font_size=H1, alignment="CENTER")
+    # 제목: 공폼 형식 "(○○호 사고종류) 사고 보고" — 선박명 + 사고종류
+    ship_title = data["선명"] if data.get("선명") and data["선명"] != "00" else "○○호"
+    b.add_paragraph(f"({ship_title} {data['사고종류']}) 사고 보고", bold=True, font_size=H1, alignment="CENTER")
     b.add_paragraph(f"기준 일시 : {data['기준일시']}", alignment="RIGHT")
     b.add_paragraph(f"보고 센터 : {data['보고센터']}", alignment="RIGHT")
     b.add_paragraph("")
@@ -1940,15 +1942,14 @@ def _compose_report_hwpx(data: dict) -> bytes:
         ["소유자/선박회사", data["소유자"], "국적", data["국적"]],
         ["선박번호", data["선박번호"], "선적항", data["선적항"]],
         ["화물", data["화물"], "검사기관", data["검사기관"]],
-        ["보험 현황", data["보험현황"], "", ""],
     ]
-    merge = [(5, 1, 1, 3)]                              # 보험현황 값 3칸 병합
-    label_bg = {(r, 0): "#EFEFEF" for r in range(6)}
+    label_bg = {(r, 0): "#EFEFEF" for r in range(5)}
     label_bg.update({(r, 2): "#EFEFEF" for r in range(5)})
     try:
-        b.add_table(rows, merge_info=merge, cell_colors=label_bg)
+        b.add_table(rows, cell_colors=label_bg)
     except Exception:
-        b.add_table(rows, merge_info=merge)
+        b.add_table(rows)
+    b.add_paragraph(f"** 보험 현황 : {data['보험현황']}")   # 공폼: 표 아래 별도 줄
 
     b.add_paragraph("□ 피해사항", bold=True, font_size=H2)
     b.add_bullet_list([f"인명 : {data['인명피해']}", f"오염 : {data['오염피해']}",
