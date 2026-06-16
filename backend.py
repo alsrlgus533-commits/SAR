@@ -1211,6 +1211,22 @@ def _rel_position(lat, lon) -> str:
     return f"{name} {_DIR8[round(brg / 45) % 8]}쪽 {dist_txt}마일"
 
 
+def _add_hemisphere(loc: str) -> str:
+    """좌표 토큰에 방위(N/E)가 없으면 자동 부착. 위도(33~39)→N, 경도(124~132)→E.
+    입력 정밀도는 그대로 두고 방위 글자만 추가 (도 값으로 판별 → 순서 무관)."""
+    def repl(m):
+        num, hemi = m.group(1), m.group(2)
+        if hemi:
+            return m.group(0)
+        deg = int(re.match(r"\d+", num).group())
+        if 30 <= deg <= 45:
+            return num + "N"
+        if 120 <= deg <= 135:
+            return num + "E"
+        return m.group(0)
+    return re.sub(r"(\d{1,3}(?:[-–]\d{1,2}(?:\.\d+)?|\.\d+))([NSEWnsew])?", repl, loc)
+
+
 def _build_report_text(utterance: str) -> str:
     """사고 자유텍스트 → 1차(속보) 보고서 텍스트."""
     parsed = _parse_nl(utterance)
@@ -1281,7 +1297,7 @@ def _build_report_text(utterance: str) -> str:
     # 위치 (+ 기준점 상대위치) → 바로 아래에 기상
     if loc:
         relpos = _rel_position(lat, lon)
-        L.append(f"▶ 위치: {loc}" + (f" ({relpos})" if relpos else ""))
+        L.append(f"▶ 위치: {_add_hemisphere(loc)}" + (f" ({relpos})" if relpos else ""))
     L.append(weather_line)
 
     # 승선·화물 — MTIS 출항전 점검표(실제) 우선, 없으면 보고자 입력값
