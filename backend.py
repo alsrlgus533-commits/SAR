@@ -1721,6 +1721,55 @@ def _kr_date(d: datetime) -> str:
     return f"{d.year}. {d.month}. {d.day}.({'월화수목금토일'[d.weekday()]})"
 
 
+def _summary_narrative(f: dict) -> str:
+    """공폼 예시 형식의 '사고개요' 한 문장 작성. LLM(Gemini→Claude) 우선, 실패 시 규칙 조립.
+
+    예시: 2019. 1. 20.(일) 여수-거문 항로를 운항중인 여객선 섬나라2호(승무원 4명, 여객 32명,
+    차량 8대)가 09:20 00항을 출항하여 초도항으로 운항 중 09:25경 00도 북동쪽 0.5마일 지점에서
+    좌현 주기관 손상 사고 발생
+    """
+    def fallback():
+        s = (f.get("date", "") + " ")
+        if f.get("route"):
+            s += f"{f['route']} 항로를 운항중인 "
+        s += f"여객선 {f.get('ship') or '○○호'}"
+        if f.get("manifest"):
+            s += f"({f['manifest']})"
+        dep = f.get("dep")
+        if dep or f.get("route"):
+            s += f"가 {dep + ' ' if dep else ''}○○항을 출항하여 ○○항으로 운항 중"
+        else:
+            s += "가 운항 중"
+        s += f" {f.get('spot') or '○○ 부근'} 지점에서 {f.get('summary') or '사고'} 발생"
+        return s
+
+    if not (GEMINI_KEY or ANTHROPIC_KEY):
+        return fallback()
+    prompt = (
+        "다음 사실로 해양사고 보고서의 '사고개요'를 한국어 한 문장으로 작성하라. "
+        "아래 예시의 문체·구조를 그대로 따른다.\n\n"
+        "예시: \"2019. 1. 20.(일) 여수-거문 항로를 운항중인 여객선 섬나라2호(승무원 4명, 여객 32명, "
+        "차량 8대)가 09:20 00항을 출항하여 초도항으로 운항 중 09:25경 00도 북동쪽 0.5마일 지점에서 "
+        "좌현 주기관 손상 사고 발생\"\n\n"
+        f"사실:\n- 날짜: {f.get('date') or '미상'}\n- 항로: {f.get('route') or '미상'}\n"
+        f"- 선박: {f.get('ship') or '미상'}\n- 승선: {f.get('manifest') or '미상'}\n"
+        f"- 출항시각: {f.get('dep') or '미상'}\n- 사고위치: {f.get('spot') or '미상'}\n"
+        f"- 사고내용: {f.get('summary') or '미상'}\n\n"
+        "규칙:\n"
+        "- 반드시 한 문장, '…사고 발생' 또는 '…발생'으로 끝낸다.\n"
+        "- 출발항·도착항·사고시각처럼 사실에 없는 항목은 지어내지 말고 공폼처럼 '○○항','○○경' 빈칸으로 둔다.\n"
+        "- 알고 있는 값(날짜·항로·선박·승선·출항시각·사고위치·사고내용)은 빠짐없이 넣는다.\n"
+        "- 따옴표·설명·접두어 없이 문장만 출력한다."
+    )
+    try:
+        out = _gemini_generate(prompt, 400) if GEMINI_KEY else _claude_generate(prompt, 400)
+        out = (out or "").strip().strip('"').strip()
+        line = out.splitlines()[0].strip() if out else ""
+        return line or fallback()
+    except Exception:
+        return fallback()
+
+
 def _build_report_data(utterance: str, extra: dict = None, center: str = "") -> dict:
     """챗봇 입력 → 공폼 보고서용 데이터 dict 구성.
     우선순위: 회사 선박마스터 > KOMSA/MTIS > LLM 추정 > 공폼 자리표시자."""
@@ -1784,7 +1833,7 @@ def _build_report_data(utterance: str, extra: dict = None, center: str = "") -> 
     else:
         crew_n, pax_n, veh_n = crew, pax, 0
 
-    # 서술형 사고개요
+    # 서술형 사고개요 (공폼 예시 형식) — Gemini 우선, 실패 시 규칙 조립
     mani = []
     if crew_n:
         mani.append(f"승무원 {crew_n}명")
@@ -1793,18 +1842,16 @@ def _build_report_data(utterance: str, extra: dict = None, center: str = "") -> 
     if veh_n:
         mani.append(f"차량 {veh_n}대")
     relpos = _rel_position(lat, lon)
-    narr = _kr_date(now) + " "
-    if route_nm:
-        narr += f"{route_nm} 항로를 운항 중인 "
-    narr += f"여객선 {ship or '○○호'}"
-    if mani:
-        narr += "(" + ", ".join(mani) + ")"
-    if dep:
-        narr += f"가 {dep}경 출항하여 운항 중"
-    spot = relpos or _add_hemisphere(loc) if loc else ""
-    if spot:
-        narr += f" {spot} 지점에서"
-    narr += f" {summary or '사고'} 발생"
+    spot = relpos or (_add_hemisphere(loc) if loc else "")
+    narr = _summary_narrative({
+        "date": _kr_date(now),
+        "route": route_nm,
+        "ship": ship,
+        "manifest": ", ".join(mani),
+        "dep": dep,
+        "spot": spot,
+        "summary": summary,
+    })
 
     # 화물
     cargo_mt = str((mtis or {}).get("화물적재중량") or "").strip()
