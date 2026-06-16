@@ -879,17 +879,34 @@ def _rule_parse(text: str) -> dict:
 
 
 def _parse_nl(text: str) -> dict:
-    """LLM(Gemini→Claude) 파싱 시도, 실패 시 규칙 파싱."""
-    try:
-        if GEMINI_KEY or ANTHROPIC_KEY:
-            raw = _gemini_parse(text) if GEMINI_KEY else _claude_parse(text)
-            raw = raw.replace("```json", "").replace("```", "").strip()
+    """LLM 파싱 시도(Gemini→Claude), 모두 실패 시 규칙 파싱.
+    Gemini 429 등 장애 시에도 Claude로 폴백해 추출 품질 유지."""
+    for fn, key in ((_gemini_parse, GEMINI_KEY), (_claude_parse, ANTHROPIC_KEY)):
+        if not key:
+            continue
+        try:
+            raw = fn(text).replace("```json", "").replace("```", "").strip()
             d = json.loads(raw)
             if isinstance(d, dict) and any(d.values()):
                 return d
-    except Exception:
-        pass
+        except Exception:
+            continue
     return _rule_parse(text)
+
+
+def _llm_text(prompt: str, max_tokens: int = 256) -> str:
+    """범용 LLM 텍스트 생성: Gemini 우선 → 실패(429 등) 시 Claude → 둘 다 실패 시 ''."""
+    if GEMINI_KEY:
+        try:
+            return _gemini_generate(prompt, max_tokens)
+        except Exception as exc:
+            print(f"[llm] Gemini 실패 → Claude 시도: {exc}", flush=True)
+    if ANTHROPIC_KEY:
+        try:
+            return _claude_generate(prompt, max_tokens)
+        except Exception as exc:
+            print(f"[llm] Claude 실패: {exc}", flush=True)
+    return ""
 
 
 def _parse_coord(s: str):
@@ -1698,7 +1715,7 @@ def _infer_report_fields(utterance: str, ship: str, summary: str, extra: dict) -
         "확인되지 않은 항목은 공폼 관례대로 '확인 중' 또는 '없음'으로 적는다. 한국어로."
     )
     try:
-        raw = _gemini_generate(prompt, 700) if GEMINI_KEY else _claude_generate(prompt, 700)
+        raw = _llm_text(prompt, 700)
         raw = (raw or "").replace("```json", "").replace("```", "").strip()
         d = json.loads(raw)
         out = dict(fallback)
@@ -1762,7 +1779,7 @@ def _summary_narrative(f: dict) -> str:
         "- 따옴표·설명·접두어 없이 문장만 출력한다."
     )
     try:
-        out = _gemini_generate(prompt, 400) if GEMINI_KEY else _claude_generate(prompt, 400)
+        out = _llm_text(prompt, 400)
         out = (out or "").strip().strip('"').strip()
         line = out.splitlines()[0].strip() if out else ""
         return line or fallback()
