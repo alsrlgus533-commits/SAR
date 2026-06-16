@@ -1487,16 +1487,32 @@ def kakao_skill():
             "사고 내용을 한 문장으로 입력해 주세요.\n"
             "예) 섬사랑12호 추자도 북동방 2해리, 여객 28명 승무원 4명, 폐그물 감김"))
 
-    # ① [개요 수정]/[조치사항 수정] 버튼 → 입력 대기 모드
-    if utterance in ("개요 수정", "조치사항 수정"):
+    # ① [개요/조치사항 수정] — 버튼(키워드만) 또는 "개요 수정 <내용>" 한 줄 모두 처리
+    _edit_m = re.match(r"^(개요|조치사항)\s*수정\s*(.*)$", utterance, re.S)
+    if _edit_m:
         if not sess.get("report"):
             return jsonify(_kakao_text("먼저 사고 내용을 입력해 주세요."))
-        field = "개요" if "개요" in utterance else "조치사항"
-        _session_set(uid, mode="edit_" + field)
-        return jsonify(_kakao_text(
-            f"✏️ {field}을(를) 어떻게 바꿀까요? 추가·삭제·교체 모두 가능합니다.\n"
-            f"예) ‘예비타기 전환·인근 어선 지원요청 추가’\n"
-            f"예) ‘삭제하고 「우현 타기 완전고장으로 자력항행 불가」로 변경’"))
+        field, rest = _edit_m.group(1), _edit_m.group(2).strip()
+        if not rest:                              # 키워드만 → 입력 대기 모드
+            _session_set(uid, mode="edit_" + field)
+            return jsonify(_kakao_text(
+                f"✏️ {field}을(를) 어떻게 바꿀까요? 추가·삭제·교체 모두 가능합니다.\n"
+                f"예) ‘예비타기 전환·인근 어선 지원요청 추가’\n"
+                f"예) ‘삭제하고 「우현 타기 완전고장으로 자력항행 불가」로 변경’\n"
+                f"(또는 ‘{field} 수정 …내용…’ 처럼 한 줄로 입력해도 됩니다)"))
+        # 키워드 + 내용 한 줄 → 바로 수정 (선박·위치 등 기존 보고서 유지)
+        report = sess["report"]
+        if callback_url:
+            _session_set(uid, mode=None)
+            threading.Thread(target=_kakao_edit_callback,
+                             args=(callback_url, uid, field, report, rest), daemon=True).start()
+            return jsonify({"version": "2.0", "useCallback": True,
+                            "data": {"text": f"✏️ {field} 수정 중입니다… 잠시만 기다려 주세요."}})
+        cur = _get_field(report, field)
+        new = _llm_edit(field, cur, rest) or ((cur + " / " + rest).strip(" /") if cur else rest)
+        rep = _set_field(report, field, new)
+        _session_set(uid, report=rep, mode=None)
+        return jsonify(_kakao_report(rep))
 
     # ② [관계기관 전송] 버튼 → 전달(공유) 안내
     if utterance == "관계기관 전송":
