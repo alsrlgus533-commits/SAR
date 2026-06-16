@@ -705,6 +705,60 @@ def _claude_parse(text: str) -> str:
     return "".join(c["text"] for c in data.get("content", []) if c.get("type") == "text")
 
 
+def _gemini_generate(prompt: str) -> str:
+    """범용 Gemini 텍스트 생성(자유 프롬프트)."""
+    model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+    payload = json.dumps(
+        {"contents": [{"parts": [{"text": prompt}]}],
+         "generationConfig": {"maxOutputTokens": 256}}, ensure_ascii=False
+    ).encode("utf-8")
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+           f"?key={urllib.parse.quote(GEMINI_KEY, safe='')}")
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+    return "".join(p.get("text", "") for p in parts)
+
+
+def _claude_generate(prompt: str) -> str:
+    """범용 Claude 텍스트 생성(자유 프롬프트)."""
+    payload = json.dumps(
+        {"model": "claude-haiku-4-5-20251001", "max_tokens": 256,
+         "messages": [{"role": "user", "content": prompt}]}, ensure_ascii=False
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/messages", data=payload,
+        headers={"Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY,
+                 "anthropic-version": "2023-06-01"}, method="POST")
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return "".join(c["text"] for c in data.get("content", []) if c.get("type") == "text")
+
+
+def _llm_edit(field: str, current: str, instruction: str) -> str:
+    """LLM으로 보고서 항목(개요/조치사항)을 지시대로 편집. 한 줄 반환, 실패 시 ''."""
+    prompt = (
+        f"너는 해양사고 1차 보고서의 '{field}' 항목을 편집한다.\n"
+        f"현재 '{field}': \"{current}\"\n"
+        f"운항관리자 지시: \"{instruction}\"\n"
+        f"지시를 반영한 새 '{field}' 내용만 한국어 한 줄로 출력하라. "
+        "추가 지시면 기존 내용에 자연스럽게 더하고, 삭제·변경 지시면 새로 작성한다. "
+        "설명·따옴표·접두어(예: '개요:') 없이 결과 문장만 출력."
+    )
+    try:
+        if GEMINI_KEY:
+            out = _gemini_generate(prompt)
+        elif ANTHROPIC_KEY:
+            out = _claude_generate(prompt)
+        else:
+            return ""
+        out = (out or "").strip().strip('"').strip()
+        return out.splitlines()[0].strip() if out else ""
+    except Exception:
+        return ""
+
+
 @app.post("/parse")
 def parse_text():
     body = request.get_json(force=True, silent=True) or {}
@@ -1355,29 +1409,47 @@ def _session_set(uid: str, **kw):
     return s
 
 
-def _append_summary(report: str, add: str) -> str:
-    """보고서의 '▶ 개요:' 줄 끝에 운항관리자 입력을 덧붙인다."""
-    add = add.strip()
-    if not add:
-        return report
-    if re.search(r"^▶ 개요:", report, re.M):
-        return re.sub(r"(^▶ 개요:[^\n]*)", lambda m: m.group(1) + " / " + add,
+def _get_field(report: str, label: str) -> str:
+    """보고서에서 '▶ {label}: ' 줄의 값 반환."""
+    m = re.search(rf"^▶ {label}: (.*)$", report, re.M)
+    return m.group(1).strip() if m else ""
+
+
+def _set_field(report: str, label: str, value: str) -> str:
+    """보고서의 '▶ {label}:' 줄 값을 교체(없으면 조치사항 앞/끝에 추가)."""
+    value = value.strip()
+    if re.search(rf"^▶ {label}: ", report, re.M):
+        return re.sub(rf"(^▶ {label}: ).*$", lambda m: m.group(1) + value,
                       report, count=1, flags=re.M)
-    return report.replace("▶ 조치사항:", f"▶ 개요: {add}\n▶ 조치사항:", 1)
+    if label != "조치사항" and "▶ 조치사항:" in report:
+        return report.replace("▶ 조치사항:", f"▶ {label}: {value}\n▶ 조치사항:", 1)
+    return report.rstrip() + f"\n▶ {label}: {value}"
 
 
 _KAKAO_QUICK = [
-    {"label": "✏️ 개요 추가", "action": "message", "messageText": "개요 추가"},
+    {"label": "✏️ 개요 수정", "action": "message", "messageText": "개요 수정"},
+    {"label": "🛠️ 조치사항 수정", "action": "message", "messageText": "조치사항 수정"},
     {"label": "📤 관계기관 전송", "action": "message", "messageText": "관계기관 전송"},
 ]
 
 
 def _kakao_report(text: str) -> dict:
-    """보고서 simpleText + 하단 바로가기 버튼(개요 추가·전송)."""
+    """보고서 simpleText + 하단 바로가기 버튼(개요·조치사항 수정·전송)."""
     return {"version": "2.0", "template": {
         "outputs": [{"simpleText": {"text": text}}],
         "quickReplies": _KAKAO_QUICK,
     }}
+
+
+def _post_callback(callback_url: str, payload: dict):
+    try:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(callback_url, data=data,
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        resp = urllib.request.urlopen(req, timeout=25)
+        print(f"[kakao] 콜백 전송 성공 status={resp.status}", flush=True)
+    except Exception as exc:
+        print(f"[kakao] 콜백 전송 실패: {exc}", flush=True)
 
 
 def _kakao_callback(callback_url: str, utterance: str, uid: str = "anon"):
@@ -1387,16 +1459,18 @@ def _kakao_callback(callback_url: str, utterance: str, uid: str = "anon"):
     except Exception as exc:
         text = f"보고서 자동작성 중 오류가 발생했습니다: {exc}"
     _session_set(uid, report=text, mode=None)
-    try:
-        payload = json.dumps(_kakao_report(text), ensure_ascii=False).encode("utf-8")
-        req = urllib.request.Request(
-            callback_url, data=payload,
-            headers={"Content-Type": "application/json"}, method="POST",
-        )
-        resp = urllib.request.urlopen(req, timeout=25)
-        print(f"[kakao] 콜백 전송 성공 status={resp.status} url={callback_url}", flush=True)
-    except Exception as exc:
-        print(f"[kakao] 콜백 전송 실패: {exc} url={callback_url}", flush=True)
+    _post_callback(callback_url, _kakao_report(text))
+
+
+def _kakao_edit_callback(callback_url: str, uid: str, field: str, report: str, instruction: str):
+    """백그라운드: LLM으로 항목(개요/조치사항) 수정 후 콜백 전송."""
+    cur = _get_field(report, field)
+    new = _llm_edit(field, cur, instruction)
+    if not new:                                   # LLM 실패 시 덧붙이기로 폴백
+        new = (cur + " / " + instruction).strip(" /") if cur else instruction
+    rep = _set_field(report, field, new)
+    _session_set(uid, report=rep, mode=None)
+    _post_callback(callback_url, _kakao_report(rep))
 
 
 @app.post("/kakao")
@@ -1413,12 +1487,16 @@ def kakao_skill():
             "사고 내용을 한 문장으로 입력해 주세요.\n"
             "예) 섬사랑12호 추자도 북동방 2해리, 여객 28명 승무원 4명, 폐그물 감김"))
 
-    # ① [개요 추가] 버튼 → 입력 대기 모드
-    if utterance == "개요 추가":
+    # ① [개요 수정]/[조치사항 수정] 버튼 → 입력 대기 모드
+    if utterance in ("개요 수정", "조치사항 수정"):
         if not sess.get("report"):
             return jsonify(_kakao_text("먼저 사고 내용을 입력해 주세요."))
-        _session_set(uid, mode="await_append")
-        return jsonify(_kakao_text("✏️ 추가할 개요 내용을 입력해 주세요.\n(기존 개요 뒤에 덧붙여집니다)"))
+        field = "개요" if "개요" in utterance else "조치사항"
+        _session_set(uid, mode="edit_" + field)
+        return jsonify(_kakao_text(
+            f"✏️ {field}을(를) 어떻게 바꿀까요? 추가·삭제·교체 모두 가능합니다.\n"
+            f"예) ‘예비타기 전환·인근 어선 지원요청 추가’\n"
+            f"예) ‘삭제하고 「우현 타기 완전고장으로 자력항행 불가」로 변경’"))
 
     # ② [관계기관 전송] 버튼 → 전달(공유) 안내
     if utterance == "관계기관 전송":
@@ -1429,11 +1507,23 @@ def kakao_skill():
             "① 위 보고서 메시지를 길게 누르기 → ② [전달] → ③ 관계기관 채팅방 선택\n"
             "※ 카카오 정책상 자동 발송 대신 전달(공유) 방식으로 보냅니다."))
 
-    # ③ 개요 덧붙이기 입력 모드 → 개요 갱신 후 보고서 재표출
-    if sess.get("mode") == "await_append" and sess.get("report"):
-        new = _append_summary(sess["report"], utterance)
-        _session_set(uid, report=new, mode=None)
-        return jsonify(_kakao_report(new))
+    # ③ 수정 입력 모드 → LLM으로 항목 편집 후 보고서 재표출
+    mode = sess.get("mode") or ""
+    if mode.startswith("edit_") and sess.get("report"):
+        field = mode[len("edit_"):]
+        report = sess["report"]
+        if callback_url:
+            _session_set(uid, mode=None)
+            threading.Thread(target=_kakao_edit_callback,
+                             args=(callback_url, uid, field, report, utterance), daemon=True).start()
+            return jsonify({"version": "2.0", "useCallback": True,
+                            "data": {"text": f"✏️ {field} 수정 중입니다… 잠시만 기다려 주세요."}})
+        # 동기 폴백
+        cur = _get_field(report, field)
+        new = _llm_edit(field, cur, utterance) or ((cur + " / " + utterance).strip(" /") if cur else utterance)
+        rep = _set_field(report, field, new)
+        _session_set(uid, report=rep, mode=None)
+        return jsonify(_kakao_report(rep))
 
     # ④ 새 사고 — 콜백(비동기) 처리
     if callback_url:
