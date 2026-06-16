@@ -80,6 +80,13 @@
   - 환경변수(선택): `VESSEL_MASTER`(CSV 경로), `VESSEL_PHOTOS`(사진 폴더 경로)
 - 회사 데이터는 **비공개**: `선박마스터.csv`·`vessel_photos/`는 `.gitignore` 등록. 커밋용 예시는 `선박마스터.csv.example`
 
+### 카카오톡에서 hwpx 받기 (다운로드 링크 방식)
+- 카카오 스킬 서버는 **파일 첨부를 보낼 수 없으므로**, 생성한 hwpx를 토큰으로 임시 보관(`_REPORT_FILES`, 1시간 TTL·메모리)하고 **공개 다운로드 URL을 textCard 버튼으로 전달**한다
+- 흐름: 1차 보고서 하단 **`📄 정식 보고서(hwpx)`** 퀵리플라이 → `/kakao`가 세션의 원문(`utterance`)으로 `_kakao_hwpx_message()` 실행(콜백 비동기) → `_store_report_file()` 토큰 발급 → `GET /report/download/<token>`(`Content-Disposition: attachment`) 링크 카드 응답
+  - 세션에 원문 보관 필요: `_kakao_callback`/동기 폴백이 `_session_set(uid, utterance=...)` 저장
+  - 카카오는 1차 보고서의 **원문**으로 hwpx를 생성한다(카카오에서 개요/조치사항을 수정한 내용은 hwpx에 미반영 — hwpx는 새 정식 초안이며 한글에서 보완)
+- 공개 링크 베이스: env **`PUBLIC_BASE_URL`**(예: `https://sarchatbot.duckdns.org`) 우선, 없으면 요청 헤더(`X-Forwarded-Proto/Host`)로 추정. 카카오 webLink는 **https 필수**라 운영 서버는 `PUBLIC_BASE_URL`을 https로 설정 권장
+
 ## 보안 규칙 (필수)
 
 **API 키는 코드에 직접 작성하지 않는다.**

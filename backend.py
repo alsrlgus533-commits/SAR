@@ -16,8 +16,10 @@ import http.cookiejar
 import json
 import os
 import re
+import secrets
 import tempfile
 import threading
+import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -1458,6 +1460,7 @@ def _set_field(report: str, label: str, value: str) -> str:
 _KAKAO_QUICK = [
     {"label": "✏️ 개요 수정", "action": "message", "messageText": "개요 수정"},
     {"label": "🛠️ 조치사항 수정", "action": "message", "messageText": "조치사항 수정"},
+    {"label": "📄 정식 보고서(hwpx)", "action": "message", "messageText": "정식 보고서"},
     {"label": "📤 관계기관 전송", "action": "message", "messageText": "관계기관 전송"},
 ]
 
@@ -1487,7 +1490,7 @@ def _kakao_callback(callback_url: str, utterance: str, uid: str = "anon"):
         text = _build_report_text(utterance)
     except Exception as exc:
         text = f"보고서 자동작성 중 오류가 발생했습니다: {exc}"
-    _session_set(uid, report=text, mode=None)
+    _session_set(uid, report=text, utterance=utterance, mode=None)
     _post_callback(callback_url, _kakao_report(text))
 
 
@@ -1552,6 +1555,22 @@ def kakao_skill():
             "① 위 보고서 메시지를 길게 누르기 → ② [전달] → ③ 관계기관 채팅방 선택\n"
             "※ 카카오 정책상 자동 발송 대신 전달(공유) 방식으로 보냅니다."))
 
+    # ②-b [정식 보고서(hwpx)] 버튼 → 공폼 서식 파일 생성 후 다운로드 링크 전달
+    if utterance == "정식 보고서":
+        src_utt = sess.get("utterance")
+        if not src_utt:
+            return jsonify(_kakao_text("먼저 사고 내용을 입력해 주세요. 1차 보고서를 만든 뒤 정식 보고서(hwpx)를 받을 수 있습니다."))
+        base = _public_base()
+        if callback_url:
+            threading.Thread(target=_kakao_hwpx_callback,
+                             args=(callback_url, uid, src_utt, base), daemon=True).start()
+            return jsonify({"version": "2.0", "useCallback": True,
+                            "data": {"text": "📄 정식 보고서(hwpx)를 작성 중입니다… 잠시만 기다려 주세요."}})
+        try:
+            return jsonify(_kakao_hwpx_message(src_utt, base))
+        except Exception as exc:
+            return jsonify(_kakao_text(f"정식 보고서(hwpx) 생성 중 오류가 발생했습니다: {exc}"))
+
     # ③ 수정 입력 모드 → LLM으로 항목 편집 후 보고서 재표출
     mode = sess.get("mode") or ""
     if mode.startswith("edit_") and sess.get("report"):
@@ -1582,7 +1601,7 @@ def kakao_skill():
     # 콜백 미설정 폴백: 동기 처리(외부 API 지연 시 5초 초과 가능)
     try:
         text = _build_report_text(utterance)
-        _session_set(uid, report=text, mode=None)
+        _session_set(uid, report=text, utterance=utterance, mode=None)
         return jsonify(_kakao_report(text))
     except Exception as exc:
         return jsonify(_kakao_text(f"보고서 자동작성 중 오류가 발생했습니다: {exc}"))
@@ -1922,6 +1941,84 @@ def report_hwpx():
         "Content-Disposition": f"attachment; filename*=UTF-8''{quoted}",
         "Content-Length": str(len(blob)),
     })
+
+
+# ── 보고서 파일 임시 보관 + 다운로드 링크 (카카오용) ──────────────
+# 카카오 스킬 서버는 파일 첨부를 보낼 수 없으므로, 생성한 hwpx를 토큰으로 임시 보관하고
+# 공개 다운로드 URL을 카드 버튼으로 전달한다(1시간 후 만료).
+
+_REPORT_FILES = {}            # token -> (blob, filename, expires_at)
+_REPORT_FILES_TTL = 3600      # 1시간
+_REPORT_FILES_MAX = 200
+
+
+def _store_report_file(blob: bytes, filename: str) -> str:
+    now = time.time()
+    for k in [k for k, v in _REPORT_FILES.items() if v[2] < now]:   # 만료분 정리
+        _REPORT_FILES.pop(k, None)
+    if len(_REPORT_FILES) > _REPORT_FILES_MAX:
+        for k in list(_REPORT_FILES)[:-_REPORT_FILES_MAX]:
+            _REPORT_FILES.pop(k, None)
+    token = secrets.token_urlsafe(16)
+    _REPORT_FILES[token] = (blob, filename, now + _REPORT_FILES_TTL)
+    return token
+
+
+def _public_base() -> str:
+    """카카오 카드 링크용 공개 베이스 URL. env 우선, 없으면 요청 헤더(프록시 포함)로 추정."""
+    b = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+    if b:
+        return b
+    proto = request.headers.get("X-Forwarded-Proto", request.scheme)
+    host = request.headers.get("X-Forwarded-Host", request.host)
+    return f"{proto}://{host}"
+
+
+@app.get("/report/download/<token>")
+def report_download(token):
+    item = _REPORT_FILES.get(token)
+    if not item or item[2] < time.time():
+        _REPORT_FILES.pop(token, None)
+        return Response("다운로드 링크가 만료되었거나 잘못되었습니다. 챗봇에서 다시 요청해 주세요.",
+                        status=404, mimetype="text/plain; charset=utf-8")
+    blob, filename, _ = item
+    quoted = urllib.parse.quote(filename)
+    return Response(blob, mimetype="application/octet-stream", headers={
+        "Content-Disposition": f"attachment; filename*=UTF-8''{quoted}",
+        "Content-Length": str(len(blob)),
+    })
+
+
+def _kakao_hwpx_message(utterance: str, base: str, center: str = "") -> dict:
+    """utterance로 hwpx 생성·보관 후, 다운로드 버튼이 달린 카카오 textCard 반환."""
+    data = _build_report_data(utterance, {}, center)
+    blob = _compose_report_hwpx(data)
+    kst = timezone(timedelta(hours=9))
+    fname = (f"{data.get('선명') or '해양사고'}_해양사고보고서_"
+             f"{datetime.now(kst).strftime('%Y%m%d_%H%M')}.hwpx")
+    token = _store_report_file(blob, fname)
+    url = f"{base}/report/download/{token}"
+    return {"version": "2.0", "template": {
+        "outputs": [{"textCard": {
+            "title": "📄 정식 해양사고 보고서(hwpx)",
+            "description": (f"{data.get('선명') or ''} · 공폼 서식으로 작성했습니다.\n"
+                            "아래 버튼을 눌러 hwpx 파일을 받으세요.\n"
+                            "※ 한글에서 열어 보완 후 본부 보고 (링크 1시간 후 만료)"),
+            "buttons": [{"action": "webLink", "label": "보고서 다운로드", "webLinkUrl": url}],
+        }}],
+        "quickReplies": _KAKAO_QUICK,
+    }}
+
+
+def _kakao_hwpx_callback(callback_url: str, uid: str, utterance: str, base: str):
+    """백그라운드: hwpx 생성·보관 후 다운로드 카드 콜백 전송."""
+    try:
+        payload = _kakao_hwpx_message(utterance, base)
+    except ImportError:
+        payload = _kakao_text("hwpx 생성 라이브러리(pyhwpxlib)가 서버에 설치되지 않았습니다. 관리자에게 문의해 주세요.")
+    except Exception as exc:
+        payload = _kakao_text(f"정식 보고서(hwpx) 생성 중 오류가 발생했습니다: {exc}")
+    _post_callback(callback_url, payload)
 
 
 # ── 진입점 ──────────────────────────────────────────
