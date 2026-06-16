@@ -355,8 +355,7 @@ const DEFAULT_CONFIG = {
     "동해항, 37-29.5N, 129-08.5E",
     "주문진항, 37-54.0N, 128-50.0E",
     "죽변항, 37-03.5N, 129-25.0E",
-  ].join("
-"),
+  ].join("\n"),
 };
 
 // ── 위경도 → 기준점 상대위치(방위 ○○방 △해리) 계산 ──
@@ -604,6 +603,8 @@ export default function App() {
   const [reviewed, setReviewed] = useState(false);
   const [sentFinal, setSentFinal] = useState(null);
   const [vesselList, setVesselList] = useState([]); // KOMSA 전체 선박(자동완성용)
+  const [center, setCenter] = useState("운항관리센터"); // 보고 센터(정식 보고서 머리글)
+  const [hwpxBusy, setHwpxBusy] = useState(false);
   const chatEnd = useRef(null);
 
   useEffect(() => { try { localStorage.setItem("sar_cfg", JSON.stringify(cfg)); } catch {} }, [cfg]);
@@ -698,9 +699,42 @@ export default function App() {
       if (상대위치) setMsgs((m) => [...m, { who: "api", text: `기준점 상대위치 자동 계산 → ${상대위치}`, live: true }]);
     }
     const total = (parseInt(parsed.여객 || 0) + parseInt(parsed.승무원 || 0)) || "";
-    setReport({ ...parsed, 상대위치, 합계: total, vessel, wx, route, 발생일시: `${new Date().toLocaleDateString("ko-KR")} ${now()}` });
+    setReport({ ...parsed, 원문: text, 상대위치, 합계: total, vessel, wx, route, 발생일시: `${new Date().toLocaleDateString("ko-KR")} ${now()}` });
     setMsgs((m) => [...m, { who: "bot", text: "1차(속보) 보고서 조안을 작성했습니다. 내용 확인 후 [발송] 버튼을 눌러주세요.", action: true }]);
     setBusy(false);
+  }
+
+  // ── 정식 해양사고 보고서(hwpx) 생성·다운로드 (backend.py /report/hwpx 경유) ──
+  async function downloadHwpx() {
+    if (!report || hwpxBusy) return;
+    setHwpxBusy(true);
+    const base = (cfg.proxy || "http://localhost:8000").replace(/\/$/, "");
+    try {
+      const res = await fetch(`${base}/report/hwpx`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ utterance: report.원문 || "", center, extra }),
+      });
+      if (!res.ok) {
+        let msg = `HTTP ${res.status}`;
+        try { const j = await res.json(); msg = j.error || msg; } catch { /* 비JSON 응답 */ }
+        throw new Error(msg);
+      }
+      const blob = await res.blob();
+      const date = new Date();
+      const ymd = `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, "0")}${String(date.getDate()).padStart(2, "0")}`;
+      const fname = `${report.선박명 || "해양사고"}_해양사고보고서_${ymd}.hwpx`;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = fname;
+      document.body.appendChild(a); a.click(); a.remove();
+      URL.revokeObjectURL(url);
+      setMsgs((m) => [...m, { who: "bot", text: `정식 해양사고 보고서(hwpx)를 생성해 다운로드했습니다 → ${fname} (한글에서 열어 검토·보완 후 본부 보고)` }]);
+    } catch (e) {
+      setMsgs((m) => [...m, { who: "bot", text: `보고서(hwpx) 생성 실패: ${e.message} — backend.py 실행 여부와 pyhwpxlib 설치(pip install -r requirements.txt)를 확인하세요.` }]);
+    } finally {
+      setHwpxBusy(false);
+    }
   }
 
   const S = styles;
@@ -888,6 +922,16 @@ export default function App() {
                     placeholder={key === "경위" ? "예: 추자항 출항 후 10분경 프로펠러 이상 진동 감지…" : key === "피해" ? "예: 인명피해 없음, 추진기 손상 여부 점검 예정" : "예: 예인선 도착 후 추자항 예인, 정밀 점검 실시"} />
                 </div>
               ))}
+            </div>
+            <div style={{ marginTop: 12, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+              <span style={{ ...S.formLabel, marginBottom: 0 }}>보고 센터</span>
+              <input style={{ ...S.textarea, width: 220, padding: "8px 10px" }} value={center} disabled={!!sentFinal}
+                onChange={(e) => setCenter(e.target.value)} placeholder="예: 여수운항관리센터" />
+              <button style={{ ...S.primaryBtnLg, background: "#0B5394", padding: "10px 16px", opacity: hwpxBusy ? 0.5 : 1 }}
+                disabled={hwpxBusy} onClick={downloadHwpx}>
+                {hwpxBusy ? "보고서 생성 중…" : "📄 정식 보고서(hwpx) 다운로드"}
+              </button>
+              <span style={{ fontSize: 12, color: "#5A6B80" }}>공폼 서식 · 회사 선박마스터·기상·제원 자동 반영 · 한글에서 보완</span>
             </div>
             {!sentFinal ? (
               <div style={S.sendArea}>

@@ -7,8 +7,10 @@
 | 파일 | 역할 |
 |------|------|
 | `해양사고-신속보고-프로토타입.jsx` | React 프론트엔드. 챗봇 UI, 백엔드 호출, 보고서 출력 |
-| `backend.py` | Flask 백엔드. API 키 보관, `/vessel` · `/route` · `/weather` · `/predep` · `/parse` · `/kakao` 엔드포인트 |
-| `requirements.txt` | Python 의존성 (flask, flask-cors, python-dotenv) |
+| `backend.py` | Flask 백엔드. API 키 보관, `/vessel` · `/route` · `/weather` · `/predep` · `/parse` · `/kakao` · `/report/hwpx` 엔드포인트 |
+| `requirements.txt` | Python 의존성 (flask, flask-cors, python-dotenv, pyhwpxlib) |
+| `선박마스터.csv` | (회사 보유·비공개) 선박별 보험·선박번호·선적항·검사기관·국적·사진파일명. `선박마스터.csv.example` 참고 |
+| `vessel_photos/` | (회사 보유·비공개) 선박 사진 이미지. `선박마스터.csv`의 `사진파일명`이 가리킴 |
 | `proxy.py` | 구 CORS 프록시 — `backend.py`로 대체됨 |
 
 ## 외부 API (모두 backend.py 서버에서 호출 — 브라우저에 키 미노출)
@@ -64,6 +66,19 @@
   - 기존 `/vessel`·`/route`·`/weather` 엔드포인트는 이 내부 함수들의 얇은 래퍼로 리팩터됨(웹 프론트 동작 동일)
 - 콜백 미설정 시 동기 폴백(외부 API 지연 시 5초 초과 가능)
 - 공개 노출 필요: 카카오는 **공개 HTTPS**로 호출 → 테스트는 `ngrok http 8000`(URL은 `https://…/kakao`), 운영은 클라우드 배포. 별도 키 불필요(기존 `.env` 사용)
+
+## 정식 해양사고 보고서(hwpx) 자동 작성 (2단계)
+
+챗봇이 모은 데이터를 **운항관리센터 정식 서식(`해양사고 공폼.pdf`)** 에 맞춘 **hwpx 보고서**로 변환·다운로드한다.
+
+- 백엔드 엔드포인트: `POST /report/hwpx` — body `{ utterance, center, extra:{경위,피해,조치} }`. 응답은 hwpx 바이트(`Content-Disposition: attachment`). 프론트 ③단계 **`📄 정식 보고서(hwpx) 다운로드`** 버튼이 호출
+- **hwpx 생성 = `pyhwpxlib`(HwpxBuilder)로 직접 작성** — 한글 오피스/템플릿 파일 불필요. `_compose_report_hwpx()`가 제목·□사고개요·□선박제원(표, 라벨 음영·보험현황 병합)·□피해사항·□조치사항·□조치계획·사진·날짜를 공폼 순서대로 조립. 산출은 유효 hwpx(zip, `mimetype=application/hwp+zip`)
+- **데이터 우선순위: 회사 선박마스터 > KOMSA/MTIS > LLM 추정 > 공폼 자리표시자(`00`/`확인 중`/`없음`)** — `_build_report_data()`가 `_parse_nl`·`_vessel_lookup`·`_route_lookup`·`_predep_lookup`·`_weather_lookup`(기존 재사용) + `_vessel_master` + `_infer_report_fields`를 병합
+  - `_vessel_master(name, code)`: `선박마스터.csv`(UTF-8, 헤더 `선박명,선박코드,보험현황,선박번호,선적항,검사기관,국적,사진파일명`)에서 보험·선박번호·선적항·검사기관·국적·사진을 조회(5분 캐시, 없으면 graceful 빈 dict). 키는 선박코드 우선, 다음 선박명(부분일치 폴백)
+  - 사진: `vessel_photos/<사진파일명>`(jpg/png)을 표 위에 삽입. 파일 없으면 생략
+  - `_infer_report_fields()`: LLM(Gemini→Claude, 기존 `_gemini_generate`/`_claude_generate` 재사용)으로 `사고종류(공폼 18종)·추정원인·인명/오염/선박 피해·지연시간·조치사항·조치계획` 추정. 키·네트워크 실패 시 규칙 폴백(`_accident_type` 등)
+  - 환경변수(선택): `VESSEL_MASTER`(CSV 경로), `VESSEL_PHOTOS`(사진 폴더 경로)
+- 회사 데이터는 **비공개**: `선박마스터.csv`·`vessel_photos/`는 `.gitignore` 등록. 커밋용 예시는 `선박마스터.csv.example`
 
 ## 보안 규칙 (필수)
 

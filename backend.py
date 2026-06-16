@@ -11,20 +11,24 @@
   pip install -r requirements.txt
   python backend.py
 """
+import csv
 import http.cookiejar
 import json
 import os
 import re
+import tempfile
 import threading
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 
 load_dotenv()
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 KOMSA_KEY = os.environ.get("KOMSA_KEY", "")
 KOMSA_URL = os.environ.get(
@@ -705,12 +709,12 @@ def _claude_parse(text: str) -> str:
     return "".join(c["text"] for c in data.get("content", []) if c.get("type") == "text")
 
 
-def _gemini_generate(prompt: str) -> str:
+def _gemini_generate(prompt: str, max_tokens: int = 256) -> str:
     """범용 Gemini 텍스트 생성(자유 프롬프트)."""
     model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
     payload = json.dumps(
         {"contents": [{"parts": [{"text": prompt}]}],
-         "generationConfig": {"maxOutputTokens": 256}}, ensure_ascii=False
+         "generationConfig": {"maxOutputTokens": max_tokens}}, ensure_ascii=False
     ).encode("utf-8")
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
            f"?key={urllib.parse.quote(GEMINI_KEY, safe='')}")
@@ -721,10 +725,10 @@ def _gemini_generate(prompt: str) -> str:
     return "".join(p.get("text", "") for p in parts)
 
 
-def _claude_generate(prompt: str) -> str:
+def _claude_generate(prompt: str, max_tokens: int = 256) -> str:
     """범용 Claude 텍스트 생성(자유 프롬프트)."""
     payload = json.dumps(
-        {"model": "claude-haiku-4-5-20251001", "max_tokens": 256,
+        {"model": "claude-haiku-4-5-20251001", "max_tokens": max_tokens,
          "messages": [{"role": "user", "content": prompt}]}, ensure_ascii=False
     ).encode("utf-8")
     req = urllib.request.Request(
@@ -757,6 +761,31 @@ def _llm_edit(field: str, current: str, instruction: str) -> str:
         return out.splitlines()[0].strip() if out else ""
     except Exception:
         return ""
+
+
+def _llm_edit_multi(report: str, instruction: str):
+    """LLM으로 개요·조치사항을 한 지시로 동시 편집. {'개요':.., '조치사항':..} 반환, 실패 시 None."""
+    cur_o, cur_a = _get_field(report, "개요"), _get_field(report, "조치사항")
+    prompt = (
+        "해양사고 1차 보고서의 '개요'와 '조치사항'을 운항관리자 지시대로 수정한다.\n"
+        f"현재 개요: \"{cur_o}\"\n현재 조치사항: \"{cur_a}\"\n"
+        f"운항관리자 지시: \"{instruction}\"\n"
+        "수정 결과를 JSON으로만 출력하라: {\"개요\":\"...\",\"조치사항\":\"...\"}\n"
+        "지시에 언급되지 않은 항목은 현재 값을 그대로 유지한다. 설명·마크다운 없이 JSON만."
+    )
+    try:
+        if GEMINI_KEY:
+            raw = _gemini_generate(prompt)
+        elif ANTHROPIC_KEY:
+            raw = _claude_generate(prompt)
+        else:
+            return None
+        raw = (raw or "").replace("```json", "").replace("```", "").strip()
+        d = json.loads(raw)
+        return {"개요": (str(d.get("개요", cur_o)).strip() or cur_o),
+                "조치사항": (str(d.get("조치사항", cur_a)).strip() or cur_a)}
+    except Exception:
+        return None
 
 
 @app.post("/parse")
@@ -1557,6 +1586,342 @@ def kakao_skill():
         return jsonify(_kakao_report(text))
     except Exception as exc:
         return jsonify(_kakao_text(f"보고서 자동작성 중 오류가 발생했습니다: {exc}"))
+
+
+# ── /report/hwpx (정식 해양사고 보고서 hwpx 자동 작성) ───────────
+# 챗봇 데이터(제원·항로·MTIS·기상) + 회사 선박마스터(보험·선박번호·사진 등) + LLM 추정을
+# 종합해 '해양사고 공폼' 서식의 hwpx 파일을 직접 생성(pyhwpxlib, 한글 오피스 불필요).
+
+_VESSEL_MASTER_PATH = os.environ.get("VESSEL_MASTER", os.path.join(BASE_DIR, "선박마스터.csv"))
+_VESSEL_PHOTO_DIR = os.environ.get("VESSEL_PHOTOS", os.path.join(BASE_DIR, "vessel_photos"))
+_MASTER_CACHE = {"at": 0.0, "rows": None}
+
+# 공폼 사고종류(18종) 키워드 매핑 — LLM 미사용 시 폴백 분류
+_ACC_TYPES = [
+    (r"충돌", "충돌"), (r"접촉", "접촉"), (r"좌초", "좌초"), (r"좌주|운항저해", "운항저해"),
+    (r"전복", "전복"), (r"화재", "화재"), (r"폭발", "폭발"), (r"침몰", "침몰"),
+    (r"행방불명|실종", "행방불명"), (r"기관|엔진", "기관손상"),
+    (r"추진축|축계|동력전달", "추진축계손상"), (r"타기|조타|조향|러더", "조타장치손상"),
+    (r"속구", "속구손상"), (r"침수", "침수"),
+    (r"부유물|폐그물|폐로프|감김|감겨|이물질|프로펠러|스크류|추진기", "부유물감김"),
+    (r"오염|기름|유출", "해양오염"), (r"안전사고|부상|추락", "안전사고"),
+]
+
+
+def _vessel_master(name: str = "", code: str = "") -> dict:
+    """선박마스터.csv(회사 보유: 보험·선박번호·선적항·검사기관·국적·사진파일명) 조회.
+    파일/행 없으면 빈 dict(graceful). 5분 메모리 캐시. 키는 선박코드 우선, 다음 선박명."""
+    import time
+    now = time.time()
+    if _MASTER_CACHE["rows"] is None or (now - _MASTER_CACHE["at"]) > 300:
+        rows = []
+        try:
+            with open(_VESSEL_MASTER_PATH, encoding="utf-8-sig", newline="") as f:
+                rows = list(csv.DictReader(f))
+        except FileNotFoundError:
+            rows = []
+        except Exception as exc:
+            print(f"[report] 선박마스터.csv 읽기 실패: {exc}", flush=True)
+            rows = []
+        _MASTER_CACHE["rows"], _MASTER_CACHE["at"] = rows, now
+    rows = _MASTER_CACHE["rows"] or []
+    norm = lambda s: str(s or "").replace(" ", "")
+    if code:
+        for r in rows:
+            if norm(r.get("선박코드")) == norm(code):
+                return dict(r)
+    if name:
+        for r in rows:
+            if norm(r.get("선박명")) == norm(name):
+                return dict(r)
+        for r in rows:                       # 부분일치 폴백
+            if norm(name) and norm(name) in norm(r.get("선박명")):
+                return dict(r)
+    return {}
+
+
+def _accident_type(summary: str, utterance: str) -> str:
+    """사고개요·원문에서 공폼 사고종류(18종) 추정. 폴백 '기타'."""
+    blob = f"{summary} {utterance}"
+    for pat, label in _ACC_TYPES:
+        if re.search(pat, blob):
+            return label
+    return "기타"
+
+
+def _infer_report_fields(utterance: str, ship: str, summary: str, extra: dict) -> dict:
+    """LLM으로 공폼의 빈 항목 추정: 사고종류·추정원인·인명/오염/선박 피해·지연시간·
+    조치사항(list)·조치계획(list). 실패 시 안전 기본값."""
+    now_hm = datetime.now(timezone(timedelta(hours=9))).strftime("%H:%M")
+    fallback = {
+        "사고종류": _accident_type(summary, utterance),
+        "추정원인": "확인 중",
+        "인명피해": "없음",
+        "오염피해": "없음",
+        "선박피해": "확인 중",
+        "지연시간": "확인 중",
+        "조치사항": [f"{now_hm} 사고 접수", "관계기관 상황전파(지방청·해경서)", _DEFAULT_ACTION],
+        "조치계획": ["사고 부위 정밀 점검·수리 예정", "재발방지 대책 마련 및 교육 실시 예정"],
+    }
+    if not (GEMINI_KEY or ANTHROPIC_KEY):
+        return fallback
+    prompt = (
+        "너는 해양사고 정식 보고서('해양사고 공폼') 작성을 돕는다. 아래 신고 내용으로 공폼의 항목을 "
+        "추정해 JSON으로만 출력하라.\n"
+        f"선박: {ship or '미상'}\n사고개요: {summary or utterance}\n신고 원문: {utterance}\n"
+        f"운항관리자 보충 — 경위: {extra.get('경위','')} / 피해: {extra.get('피해','')} / 조치: {extra.get('조치','')}\n\n"
+        "출력 형식(JSON, 설명·마크다운 금지):\n"
+        "{\"사고종류\":\"공폼 18종 중 하나(충돌/접촉/좌초/전복/화재/폭발/침몰/행방불명/기관손상/"
+        "추진축계손상/조타장치손상/속구손상/침수/부유물감김/운항저해/해양오염/안전사고/기타)\","
+        "\"추정원인\":\"한 줄\",\"인명피해\":\"없음 또는 내용\",\"오염피해\":\"없음 또는 내용\","
+        "\"선박피해\":\"없음/확인 중 또는 내용\",\"지연시간\":\"확인 중 또는 내용\","
+        "\"조치사항\":[\"시각 포함 한 줄씩\"],\"조치계획\":[\"한 줄씩\"]}\n"
+        "확인되지 않은 항목은 공폼 관례대로 '확인 중' 또는 '없음'으로 적는다. 한국어로."
+    )
+    try:
+        raw = _gemini_generate(prompt, 700) if GEMINI_KEY else _claude_generate(prompt, 700)
+        raw = (raw or "").replace("```json", "").replace("```", "").strip()
+        d = json.loads(raw)
+        out = dict(fallback)
+        for k in ("사고종류", "추정원인", "인명피해", "오염피해", "선박피해", "지연시간"):
+            v = str(d.get(k, "")).strip()
+            if v:
+                out[k] = v
+        for k in ("조치사항", "조치계획"):
+            v = d.get(k)
+            if isinstance(v, list) and v:
+                out[k] = [str(x).strip() for x in v if str(x).strip()]
+            elif isinstance(v, str) and v.strip():
+                out[k] = [v.strip()]
+        return out
+    except Exception:
+        return fallback
+
+
+def _kr_date(d: datetime) -> str:
+    return f"{d.year}. {d.month}. {d.day}.({'월화수목금토일'[d.weekday()]})"
+
+
+def _build_report_data(utterance: str, extra: dict = None, center: str = "") -> dict:
+    """챗봇 입력 → 공폼 보고서용 데이터 dict 구성.
+    우선순위: 회사 선박마스터 > KOMSA/MTIS > LLM 추정 > 공폼 자리표시자."""
+    extra = extra or {}
+    parsed = _parse_nl(utterance)
+    ship = str(parsed.get("선박명") or "").strip()
+    loc = str(parsed.get("사고위치") or "").strip()
+    pax = str(parsed.get("여객") or "").strip()
+    crew = str(parsed.get("승무원") or "").strip()
+    summary = str(parsed.get("사고개요") or "").strip()
+
+    vessel = route_info = mtis = None
+    if ship:
+        try:
+            vessel = _vessel_lookup(ship)
+        except Exception:
+            vessel = None
+        try:
+            route_info = _route_lookup(ship)
+        except Exception:
+            route_info = None
+        cd = (vessel or {}).get("선박코드", "")
+        if cd:
+            try:
+                mtis = _predep_lookup(cd)
+            except Exception:
+                mtis = None
+
+    lat, lon = _extract_latlon(loc)
+    wx = _weather_lookup(loc, "" if lat is None else str(lat), "" if lon is None else str(lon))
+    if wx.get("error"):
+        wx = None
+
+    master = _vessel_master(ship, (vessel or {}).get("선박코드", ""))
+    inf = _infer_report_fields(utterance, ship, summary, extra)
+
+    kst = timezone(timedelta(hours=9))
+    now = datetime.now(kst)
+
+    # 현지기상
+    if wx:
+        wx_aws = wx.get("AWS") or {}
+        wparts = [f"풍향({wx.get('풍향','-')})", f"풍속({wx.get('풍속','-')})",
+                  f"파고({wx.get('파고','-')})", "시정(양호)"]
+        weather = ", ".join(wparts)
+    else:
+        weather = "풍향( ), 풍속( ), 파고( ), 시정( )"
+
+    # 항로·출항
+    route_nm = ((mtis or {}).get("항로") or (route_info or {}).get("운항항로")
+                or (route_info or {}).get("면허항로") or (vessel or {}).get("항로") or "").strip()
+    dep = str((mtis or {}).get("출항시간") or (route_info or {}).get("출발시각") or "").strip()
+    if dep and dep.isdigit():
+        dep = f"{dep.zfill(4)[:2]}:{dep.zfill(4)[2:]}"
+
+    # 승선 인원
+    if mtis:
+        crew_n = str(mtis.get("승무원") or crew or "")
+        pax_n = str(mtis.get("여객") or pax or "")
+        veh_n = mtis.get("차량") or 0
+    else:
+        crew_n, pax_n, veh_n = crew, pax, 0
+
+    # 서술형 사고개요
+    mani = []
+    if crew_n:
+        mani.append(f"승무원 {crew_n}명")
+    if pax_n:
+        mani.append(f"여객 {pax_n}명")
+    if veh_n:
+        mani.append(f"차량 {veh_n}대")
+    relpos = _rel_position(lat, lon)
+    narr = _kr_date(now) + " "
+    if route_nm:
+        narr += f"{route_nm} 항로를 운항 중인 "
+    narr += f"여객선 {ship or '○○호'}"
+    if mani:
+        narr += "(" + ", ".join(mani) + ")"
+    if dep:
+        narr += f"가 {dep}경 출항하여 운항 중"
+    spot = relpos or _add_hemisphere(loc) if loc else ""
+    if spot:
+        narr += f" {spot} 지점에서"
+    narr += f" {summary or '사고'} 발생"
+
+    # 화물
+    cargo_mt = str((mtis or {}).get("화물적재중량") or "").strip()
+    cargo = (f"{cargo_mt} M/T" if cargo_mt else "") + (f" / 차량 {veh_n}대" if veh_n else "")
+    cargo = cargo.strip(" /") or "없음"
+
+    # 선박사진 경로
+    photo = ""
+    fn = str(master.get("사진파일명") or "").strip()
+    if fn:
+        p = fn if os.path.isabs(fn) else os.path.join(_VESSEL_PHOTO_DIR, fn)
+        if os.path.exists(p):
+            photo = p
+
+    ph = "00"  # 공폼 자리표시자(미확보 항목)
+    return {
+        "사고종류": inf["사고종류"],
+        "기준일시": now.strftime("%Y년 %m월 %d일 %H:%M"),
+        "보고센터": center or "운항관리센터",
+        "사고개요": narr,
+        "현지기상": weather,
+        "선명": ship or ph,
+        "총톤수": (vessel or {}).get("총톤수") or ph,
+        "선종": (vessel or {}).get("선종") or "여객선",
+        "승무정원": crew_n or ph,
+        "소유자": (vessel or {}).get("선사") or master.get("소유자") or ph,
+        "선박번호": master.get("선박번호") or (mtis or {}).get("선박번호") or ph,
+        "화물": cargo,
+        "선적항": master.get("선적항") or ph,
+        "국적": master.get("국적") or "대한민국",
+        "검사기관": master.get("검사기관") or ph,
+        "보험현황": master.get("보험현황") or ph,
+        "사진경로": photo,
+        "인명피해": inf["인명피해"],
+        "오염피해": inf["오염피해"],
+        "선박피해": inf["선박피해"],
+        "지연시간": inf["지연시간"],
+        "추정원인": inf["추정원인"],
+        "조치사항": inf["조치사항"],
+        "조치계획": inf["조치계획"],
+        "작성일자": f"{now.year}. {now.month}. {now.day}.",
+    }
+
+
+def _compose_report_hwpx(data: dict) -> bytes:
+    """공폼 서식 hwpx 생성 → 바이트 반환. pyhwpxlib 필요(미설치 시 ImportError 전파)."""
+    from pyhwpxlib import HwpxBuilder
+
+    H1, H2 = 16, 12   # 제목 / 항목 글자크기(pt)
+    b = HwpxBuilder()
+    b.add_paragraph(f"({data['사고종류']}) 사고 보고", bold=True, font_size=H1, alignment="CENTER")
+    b.add_paragraph(f"기준 일시 : {data['기준일시']}", alignment="RIGHT")
+    b.add_paragraph(f"보고 센터 : {data['보고센터']}", alignment="RIGHT")
+    b.add_paragraph("")
+
+    b.add_paragraph("□ 사고개요", bold=True, font_size=H2)
+    b.add_paragraph(data["사고개요"])
+    b.add_paragraph(f"** 현지기상 : {data['현지기상']}")
+
+    b.add_paragraph("□ 선박제원", bold=True, font_size=H2)
+    if data.get("사진경로"):
+        try:
+            b.add_image(data["사진경로"], width=12000, height=8000)
+        except Exception as exc:
+            print(f"[report] 선박사진 삽입 실패: {exc}", flush=True)
+    rows = [
+        ["선 명", data["선명"], "총톤수", data["총톤수"]],
+        ["선 종", data["선종"], "승무정원", data["승무정원"]],
+        ["소유자/선박회사", data["소유자"], "국적", data["국적"]],
+        ["선박번호", data["선박번호"], "선적항", data["선적항"]],
+        ["화물", data["화물"], "검사기관", data["검사기관"]],
+        ["보험 현황", data["보험현황"], "", ""],
+    ]
+    merge = [(5, 1, 1, 3)]                              # 보험현황 값 3칸 병합
+    label_bg = {(r, 0): "#EFEFEF" for r in range(6)}
+    label_bg.update({(r, 2): "#EFEFEF" for r in range(5)})
+    try:
+        b.add_table(rows, merge_info=merge, cell_colors=label_bg)
+    except Exception:
+        b.add_table(rows, merge_info=merge)
+
+    b.add_paragraph("□ 피해사항", bold=True, font_size=H2)
+    b.add_bullet_list([f"인명 : {data['인명피해']}", f"오염 : {data['오염피해']}",
+                       f"선박·시설물 등 : {data['선박피해']}"], bullet_char="ㅇ")
+    b.add_paragraph(f"** 지연시간 : {data['지연시간']}")
+    b.add_paragraph(f"** 사고 추정원인 : {data['추정원인']}")
+
+    b.add_paragraph("□ 조치사항", bold=True, font_size=H2)
+    b.add_bullet_list(data["조치사항"] or ["확인 중"], bullet_char="ㅇ")
+
+    b.add_paragraph("□ 조치계획", bold=True, font_size=H2)
+    b.add_bullet_list(data["조치계획"] or ["확인 중"], bullet_char="ㅇ")
+
+    b.add_paragraph("")
+    b.add_paragraph(data["작성일자"], alignment="CENTER")
+
+    fd, path = tempfile.mkstemp(suffix=".hwpx")
+    os.close(fd)
+    try:
+        b.save(path)
+        with open(path, "rb") as f:
+            return f.read()
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+@app.post("/report/hwpx")
+def report_hwpx():
+    """챗봇 데이터 → 정식 해양사고 보고서(hwpx) 다운로드.
+    body: { utterance, center, extra:{경위,피해,조치} }"""
+    body = request.get_json(force=True, silent=True) or {}
+    utterance = str(body.get("utterance", "")).strip()
+    if not utterance:
+        return jsonify({"error": "utterance가 필요합니다"}), 400
+    center = str(body.get("center", "")).strip()
+    extra = body.get("extra") or {}
+    try:
+        data = _build_report_data(utterance, extra, center)
+        blob = _compose_report_hwpx(data)
+    except ImportError:
+        return jsonify({"error": "hwpx 생성 라이브러리(pyhwpxlib)가 없습니다. "
+                                 "pip install -r requirements.txt 후 다시 시도하세요."}), 503
+    except Exception as exc:
+        return jsonify({"error": f"보고서 생성 실패: {exc}"}), 500
+
+    kst = timezone(timedelta(hours=9))
+    fname = (f"{data.get('선명') or '해양사고'}_해양사고보고서_"
+             f"{datetime.now(kst).strftime('%Y%m%d_%H%M')}.hwpx")
+    quoted = urllib.parse.quote(fname)
+    return Response(blob, mimetype="application/octet-stream", headers={
+        "Content-Disposition": f"attachment; filename*=UTF-8''{quoted}",
+        "Content-Length": str(len(blob)),
+    })
 
 
 # ── 진입점 ──────────────────────────────────────────
