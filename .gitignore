@@ -2,6 +2,12 @@
 .env
 .env.local
 .env.*.local
+.env.save
+
+# SSH 키 — 절대 커밋하지 않음
+*.key
+*.pub
+*.pem
 
 # 의존성
 node_modules/
