@@ -95,7 +95,38 @@ nano .env
 KOMSA_KEY=실제키
 KMA_KEY=실제키
 GEMINI_KEY=실제키        # 또는 ANTHROPIC_KEY
+# ── VMS 실시간 선박위치(AIS)까지 켜려면 아래도 입력 (선택) ──
+GICOMS_VMS_ID=GICOMS_userId
+GICOMS_VMS_PW=GICOMS_비밀번호
 ```
+> ⚠️ VMS 키를 안 넣으면 신고문에 **위치가 없을 때 위경도를 자동으로 못 불러온다**(`/vessel_position` 503, 1차 속보에 AIS 위치줄 누락). 위치 자동조회가 필요하면 반드시 입력.
+
+## 4-1. VMS 실시간 위치 켜기 (선택 — 위 키를 넣었다면 필수 세트)
+VMS는 GICOMS 로그인을 **헤드리스 크롬(Playwright)** 으로 하고, 한글 선박명→MMSI 변환에 **비공개 권위목록 CSV**가 필요하다. 둘 다 GitHub엔 없으므로 VM에서 따로 준비한다.
+
+**(a) 크롬 + OS 의존성 설치** (venv 활성화 상태에서):
+```bash
+cd ~/SAR && source venv/bin/activate
+pip install -r requirements.txt            # playwright 포함 재확인
+sudo ~/SAR/venv/bin/playwright install-deps chromium   # apt 의존성(루트 필요)
+playwright install chromium                 # 브라우저 본체(ubuntu 사용자 ~/.cache 에 설치)
+```
+> 서비스가 `User=ubuntu`로 돌므로 브라우저 본체는 **sudo 없이** ubuntu로 설치해야 systemd가 찾는다. 메모리는 최소 1GB 이상 권장(`E2.1.Micro`(1GB)는 빠듯 → `A1.Flex` 권장).
+
+**(b) 권위목록 CSV 업로드** — 로컬 PC(PowerShell)에서:
+```powershell
+scp -i 받은키.key "D:\SAR - NEX-N2-MINI\선박명_MMSI.csv" ubuntu@<Public IP>:/home/ubuntu/SAR/선박명_MMSI.csv
+```
+> 헤더 `선박명,MMSI[,선박번호]`. 파일이 없으면 한글명↔MMSI 매핑이 비어 VMS 매칭이 거의 실패한다(VMS의 선박명은 100% 영문). 경로를 바꾸려면 `.env`에 `VESSEL_MMSI=/path/...` 지정.
+
+**(c) 반영**:
+```bash
+sudo systemctl restart sar
+# 확인: 위치 없는 신고문으로도 AIS 위치줄이 나오는지
+curl -X POST http://127.0.0.1:8000/kakao -H "Content-Type: application/json" \
+  -d '{"userRequest":{"utterance":"퀸제누비아2호 우현 타기 고장으로 표류중"}}'
+```
+→ 응답에 `현재위치(AIS): 34.xxxx, 126.xxxx (...)` 가 보이면 성공.
 
 ## 5. 자동실행 등록 (systemd — 부팅·크래시 시 자동 재시작)
 ```bash
