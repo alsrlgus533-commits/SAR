@@ -435,8 +435,15 @@ def _nearest_aws(plat, plon):
     return best
 
 
+# 직전 정상 sea_obs 관측 캐시 — KMA 일시 500 장애 동안 대체 제공
+# (stn=0은 전국 관측소를 일괄 반환하므로 전역 캐시 1개로 충분)
+_SEA_OBS_CACHE = {"rows": None, "at": None}
+_SEA_OBS_CACHE_TTL = 7200   # 2시간
+
+
 def _weather_lookup(loc: str, lat: str = "", lon: str = "") -> dict:
-    """해상부이 + 인근 AWS 기상 조회. 성공 시 결과 dict, 실패 시 {'error', '_status'}."""
+    """해상부이 + 인근 AWS 기상 조회. 성공 시 결과 dict, 실패 시 {'error', '_status'}.
+    KMA 일시 장애 시 직전 정상 관측(_SEA_OBS_CACHE)으로 대체(resp['_stale']=True)."""
     loc = (loc or "").strip()
     lat = (lat or "").strip()
     lon = (lon or "").strip()
@@ -457,16 +464,24 @@ def _weather_lookup(loc: str, lat: str = "", lon: str = "") -> dict:
                 time.sleep(0.6 * (attempt + 1))
         raise last
 
+    rows = None
     try:
-        text = fetch_obs(_tm_string(0))
-        rows = _parse_sea_obs(text)
+        rows = _parse_sea_obs(fetch_obs(_tm_string(0)))
         if not rows:
-            text = fetch_obs(_tm_string(-1))
-            rows = _parse_sea_obs(text)
-        if not rows:
-            return {"error": "관측자료 없음", "_status": 502}
-    except Exception as exc:
-        return {"error": str(exc), "_status": 502}
+            rows = _parse_sea_obs(fetch_obs(_tm_string(-1)))
+    except Exception:
+        rows = None
+
+    stale = False
+    if rows:
+        _SEA_OBS_CACHE["rows"], _SEA_OBS_CACHE["at"] = rows, time.time()
+    else:
+        # 기상청 일시 장애(500 등) → 최근 정상 관측을 캐시에서 대체(빈 보고서 방지)
+        cached, at = _SEA_OBS_CACHE["rows"], _SEA_OBS_CACHE["at"]
+        if cached and at and time.time() - at < _SEA_OBS_CACHE_TTL:
+            rows, stale = cached, True
+        else:
+            return {"error": "관측자료 없음(기상청 일시 장애)", "_status": 502}
 
     coord_rows = [r for r in rows if r["lat"] is not None and r["lon"] is not None]
 
@@ -535,6 +550,8 @@ def _weather_lookup(loc: str, lat: str = "", lon: str = "") -> dict:
     }
     if wh_src is not None:
         resp["파고출처"] = wh_src
+    if stale:
+        resp["_stale"] = True
 
     # ── 4) 인근 AWS(육상) 병기 + 거리상 AWS가 더 가까우면 풍향·풍속을 AWS 값으로 우선 ──
     aws = _nearest_aws(plat, plon)
@@ -1387,6 +1404,9 @@ def _build_report_text(utterance: str) -> str:
         if a and a.get("기온"):
             parts.append(f"기온 {a.get('기온')}")
         weather_line = f"▶ 기상: {wx.get('지점','')} " + ", ".join(parts)
+        if wx.get("_stale"):   # KMA 일시 장애로 직전 관측 대체
+            t = wx.get("관측시각")
+            weather_line += f" (기상청 지연—직전 관측{' ' + str(t) if t not in (None, '결측') else ''})"
     elif have_coord:
         # 위치는 확보(신고 좌표 또는 AIS)됐으나 기상청 연계가 일시 실패한 경우 — 위치 미상과 구분
         weather_line = "▶ 기상: 해상관측 일시 연계 지연 — 잠시 후 다시 시도해 주세요"
