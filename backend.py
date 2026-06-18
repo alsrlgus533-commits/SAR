@@ -2309,18 +2309,28 @@ def _vms_position_safe(name):
     return None
 
 
+def _fmt_dm(lat, lon) -> str:
+    """십진 위·경도 → 도-분 표기 'DD-MM.MN, DDD-MM.ME' (예: 34-18.4N, 126-07.8E)."""
+    def one(v, pos, neg):
+        h = pos if v >= 0 else neg
+        v = abs(v)
+        d = int(v)
+        return f"{d}-{(v - d) * 60:04.1f}{h}"
+    return f"{one(lat, 'N', 'S')}, {one(lon, 'E', 'W')}"
+
+
 def _vms_line(vpos):
-    """1차 속보용 'AIS 현재위치' 한 줄."""
+    """1차 속보용 '현재위치' 한 줄 (위·경도 도-분 표기)."""
     bits = []
     if vpos.get("속력_kn") is not None:
         bits.append(f"{vpos['속력_kn']}kn")
     if vpos.get("침로_deg") is not None:
         bits.append(f"침로 {vpos['침로_deg']}°")
     rel = _rel_position(vpos.get("위도"), vpos.get("경도"))   # 가까운 기준점 기준 사람이 읽을 상대위치
-    head = f"{vpos['위도']:.4f}, {vpos['경도']:.4f}" + (f" ({rel})" if rel else "")
+    head = _fmt_dm(vpos["위도"], vpos["경도"]) + (f" ({rel})" if rel else "")
     tail = (f" [{', '.join(bits)}]" if bits else "") + \
            (f" · {vpos.get('수신시각')}" if vpos.get("수신시각") else "")
-    return f"▶ 현재위치(AIS): {head}{tail}"
+    return f"▶ 현재위치: {head}{tail}"
 
 
 @app.get("/vessel_position")
