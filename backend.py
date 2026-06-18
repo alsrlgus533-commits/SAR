@@ -44,6 +44,10 @@ KOMSA_ROUTE_URL = os.environ.get(
 KMA_KEY = os.environ.get("KMA_KEY", "")
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_KEY", "")
 GEMINI_KEY = os.environ.get("GEMINI_KEY", "")
+# GICOMS VMS(실시간 선박위치) — 로그인 세션 필요. Playwright로 로그인 후 쿠키 재사용.
+GICOMS_VMS_ID = os.environ.get("GICOMS_VMS_ID", "")
+GICOMS_VMS_PW = os.environ.get("GICOMS_VMS_PW", "")
+GICOMS_BASE = os.environ.get("GICOMS_BASE", "http://www.gicoms.go.kr")
 PORT = int(os.environ.get("PORT", 8000))
 
 app = Flask(__name__)
@@ -1356,7 +1360,10 @@ def _build_report_text(utterance: str) -> str:
             except Exception:
                 mtis = None
 
+    vpos = _vms_position_safe(ship)
     lat, lon = _extract_latlon(loc)
+    if lat is None and vpos and vpos.get("위도") is not None:   # 신고 좌표 없으면 AIS 현위치로 기상조회
+        lat, lon = vpos["위도"], vpos["경도"]
     wx = _weather_lookup(loc, "" if lat is None else str(lat), "" if lon is None else str(lon))
     if wx.get("error"):
         wx = None
@@ -1400,6 +1407,8 @@ def _build_report_text(utterance: str) -> str:
     if loc:
         relpos = _rel_position(lat, lon)
         L.append(f"▶ 위치: {_add_hemisphere(loc)}" + (f" ({relpos})" if relpos else ""))
+    if vpos and vpos.get("위도") is not None:
+        L.append(_vms_line(vpos))
     L.append(weather_line)
 
     # 승선·화물 — MTIS 출항전 점검표(실제) 우선, 없으면 보고자 입력값
@@ -1815,7 +1824,10 @@ def _build_report_data(utterance: str, extra: dict = None, center: str = "") -> 
             except Exception:
                 mtis = None
 
+    vpos = _vms_position_safe(ship)
     lat, lon = _extract_latlon(loc)
+    if lat is None and vpos and vpos.get("위도") is not None:   # 신고 좌표 없으면 AIS 현위치 사용
+        lat, lon = vpos["위도"], vpos["경도"]
     wx = _weather_lookup(loc, "" if lat is None else str(lat), "" if lon is None else str(lon))
     if wx.get("error"):
         wx = None
@@ -1936,17 +1948,23 @@ def _compose_report_hwpx(data: dict) -> bytes:
             b.add_image(data["사진경로"], width=12000, height=8000)
         except Exception as exc:
             print(f"[report] 선박사진 삽입 실패: {exc}", flush=True)
+    # 공폼 서식: 6열 그리드 — 1열은 선박사진(세로 병합), 2개 라벨행(음영) + 2개 데이터행
     rows = [
-        ["선 명", data["선명"], "총톤수", data["총톤수"]],
-        ["선 종", data["선종"], "승무정원", data["승무정원"]],
-        ["소유자/선박회사", data["소유자"], "국적", data["국적"]],
-        ["선박번호", data["선박번호"], "선적항", data["선적항"]],
-        ["화물", data["화물"], "검사기관", data["검사기관"]],
+        ["선박사진", "선 명", "총톤수", "선 종", "승무정원", "소유자 또는\n선박회사"],
+        ["", "선박번호", "화물", "선적항", "국적", "검사기관"],
+        ["", data["선명"], data["총톤수"], data["선종"], data["승무정원"], data["소유자"]],
+        ["", data["선박번호"], data["화물"], data["선적항"], data["국적"], data["검사기관"]],
     ]
-    label_bg = {(r, 0): "#EFEFEF" for r in range(5)}
-    label_bg.update({(r, 2): "#EFEFEF" for r in range(5)})
+    merge_info = [(0, 0, 3, 0)]   # 1열(선박사진) 4행 세로 병합
+    # 라벨행(0·1행)과 선박사진 라벨 셀 음영
+    label_bg = {(0, 0): "#EFEFEF"}
+    label_bg.update({(0, c): "#EFEFEF" for c in range(1, 6)})
+    label_bg.update({(1, c): "#EFEFEF" for c in range(1, 6)})
+    cell_aligns = {(r, c): "CENTER" for r in range(4) for c in range(6)}
+    col_widths = [11000, 6300, 6300, 6300, 6300, 6320]   # 합 42520 = A4 본문폭
     try:
-        b.add_table(rows, cell_colors=label_bg)
+        b.add_table(rows, cell_colors=label_bg, merge_info=merge_info,
+                    cell_aligns=cell_aligns, col_widths=col_widths)
     except Exception:
         b.add_table(rows)
     b.add_paragraph(f"** 보험 현황 : {data['보험현황']}")   # 공폼: 표 아래 별도 줄
@@ -2084,6 +2102,211 @@ def _kakao_hwpx_callback(callback_url: str, uid: str, utterance: str, base: str)
     except Exception as exc:
         payload = _kakao_text(f"정식 보고서(hwpx) 생성 중 오류가 발생했습니다: {exc}")
     _post_callback(callback_url, payload)
+
+
+# ── GICOMS VMS 실시간 선박위치 ───────────────────────
+# 로그인은 RSA+키보드보안이라 Playwright(헤드리스 브라우저)로 수행 → 세션 쿠키만 추출해
+# 가벼운 allShipTarget.json(전국 실시간 AIS) 호출에 재사용. 쿠키 만료 시 자동 재로그인.
+
+_VMS = {"cookie": None, "at": None}          # JSESSIONID 캐시
+_VMS_LOCK = threading.Lock()
+_VMS_TARGETS = {"at": None, "items": []}     # allShipTarget 파싱결과 단기 캐시
+_VMS_COOKIE_TTL = 1500                        # 25분
+_VMS_TARGETS_TTL = 20                         # 20초
+
+
+def _vms_login():
+    """Playwright로 GICOMS 로그인 → JSESSIONID 쿠키 문자열 반환. 실패 시 예외."""
+    if not (GICOMS_VMS_ID and GICOMS_VMS_PW):
+        raise RuntimeError("GICOMS_VMS_ID/PW 미설정")
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        try:
+            ctx = browser.new_context(user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"))
+            page = ctx.new_page()
+            page.goto(f"{GICOMS_BASE}/", wait_until="domcontentloaded", timeout=30000)
+            page.evaluate("""([vid, vpw]) => {
+                const f = document.getElementById('loginForm');
+                f.id.value = vid; f.password.value = vpw;
+            }""", [GICOMS_VMS_ID, GICOMS_VMS_PW])
+            page.evaluate("actionLogin('ID')")
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            page.wait_for_timeout(2000)
+            jsess = [c["value"] for c in ctx.cookies() if c["name"] == "JSESSIONID"]
+            if not jsess:
+                raise RuntimeError("로그인 실패(JSESSIONID 없음) — 계정/비밀번호 확인")
+            return "JSESSIONID=" + jsess[-1]
+        finally:
+            browser.close()
+
+
+def _vms_cookie(force=False):
+    """캐시된 세션 쿠키 반환(없거나 만료/force면 재로그인). 동시 로그인 방지 락."""
+    with _VMS_LOCK:
+        fresh = (_VMS["cookie"] and _VMS["at"]
+                 and (datetime.now() - _VMS["at"]).total_seconds() < _VMS_COOKIE_TTL)
+        if force or not fresh:
+            _VMS["cookie"] = _vms_login()
+            _VMS["at"] = datetime.now()
+        return _VMS["cookie"]
+
+
+def _vms_all_targets(force_login=False):
+    """allShipTarget.json(전국 실시간 위치) 리스트 반환. 20초 캐시. 세션 만료 시 1회 재로그인."""
+    now = datetime.now()
+    if (not force_login and _VMS_TARGETS["items"] and _VMS_TARGETS["at"]
+            and (now - _VMS_TARGETS["at"]).total_seconds() < _VMS_TARGETS_TTL):
+        return _VMS_TARGETS["items"]
+
+    def fetch(cookie):
+        data = urllib.parse.urlencode({"userId": GICOMS_VMS_ID}).encode()
+        req = urllib.request.Request(
+            f"{GICOMS_BASE}/WEB_VMS/WebVMS/allShipTarget.json", data=data,
+            headers={"Cookie": cookie, "X-Requested-With": "XMLHttpRequest",
+                     "Referer": f"{GICOMS_BASE}/WEB_VMS/WebVMS.do",
+                     "User-Agent": "Mozilla/5.0",
+                     "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"})
+        with urllib.request.urlopen(req, timeout=40) as r:
+            return r.read().decode("utf-8", "replace")
+
+    body = fetch(_vms_cookie(force=force_login))
+    if not body.lstrip().startswith("{"):          # 세션 만료 → 재로그인 1회
+        body = fetch(_vms_cookie(force=True))
+    items = (json.loads(body) or {}).get("message") or []
+    _VMS_TARGETS["items"], _VMS_TARGETS["at"] = items, now
+    return items
+
+
+def _norm_ship(s):
+    s = str(s or "").upper().replace(" ", "")
+    return s[:-1] if s.endswith("호") else s
+
+
+_MMSI_MAP = {"at": None, "map": {}}
+
+
+def _mmsi_map():
+    """회사 권위 목록(선박명_MMSI.csv: 선박명,MMSI[,선박번호]) → {정규화선박명: MMSI}. 5분 캐시.
+    한글명↔MMSI 확정 매핑이라 VMS 위치조회 정확도를 100%로 만든다(파일 없으면 빈 dict)."""
+    path = os.environ.get("VESSEL_MMSI", os.path.join(BASE_DIR, "선박명_MMSI.csv"))
+    now = time.time()
+    if _MMSI_MAP["map"] and _MMSI_MAP["at"] and now - _MMSI_MAP["at"] < 300:
+        return _MMSI_MAP["map"]
+    m = {}
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                nm = row.get("선박명") or row.get("선명")
+                mm = row.get("MMSI") or row.get("mmsi")
+                if nm and mm:
+                    m[_norm_ship(nm)] = str(mm).strip()
+    except FileNotFoundError:
+        pass
+    _MMSI_MAP["map"], _MMSI_MAP["at"] = m, now
+    return m
+
+
+def _vms_position(name=None, mmsi=None):
+    """선박명 또는 MMSI → 실시간 위치 dict. 없으면 None.
+    매칭: ① 권위목록으로 한글명→MMSI 해석 ② MMSI 정확일치
+    ③ 목록에 없으면 선박명 정규화 정확일치 ④ '여객' 선종만 부분일치(화물선 오매칭 차단)."""
+    items = _vms_all_targets()
+    s = None
+    if not mmsi and name:                          # 권위목록(CSV)으로 한글명→MMSI
+        mmsi = _mmsi_map().get(_norm_ship(name))
+    if mmsi:
+        m = str(mmsi).strip()
+        s = next((it for it in items if str(it.get("mmsi")) == m), None)
+    if s is None and name:
+        q = _norm_ship(name)
+        if not q:
+            return None
+        exact = [it for it in items if _norm_ship(it.get("shipName")) == q]
+        if exact:
+            cands = exact
+        else:   # 정확일치 없으면 '여객' 선종에 한해서만 부분일치 허용(엉뚱한 화물선 방지)
+            cands = [it for it in items
+                     if len(q) >= 3 and q in _norm_ship(it.get("shipName"))
+                     and "여객" in str(it.get("shipType") or "")]
+        if not cands:
+            return None
+        cands.sort(key=lambda it: ("여객" not in str(it.get("shipType") or ""),
+                                   abs(len(_norm_ship(it.get("shipName"))) - len(q))))
+        s = cands[0]
+    if s is None:
+        return None
+
+    def num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+    lat, lon = num(s.get("latitude")), num(s.get("longitude"))
+    cog, sog, hdg = num(s.get("cog")), num(s.get("sog")), num(s.get("heading"))
+    # 원시 AIS 단위(×10) 보정: cog/sog는 0.1 단위, heading 511=미지정
+    if cog is not None:
+        cog = round(cog / 10, 1) if cog > 360 else cog
+    if sog is not None:
+        sog = round(sog / 10, 1) if sog > 102.2 else sog
+    if hdg is not None and hdg >= 360:
+        hdg = None
+    return {
+        "선박명": s.get("shipName"), "mmsi": s.get("mmsi"),
+        "위도": lat, "경도": lon, "속력_kn": sog, "침로_deg": cog, "선수방위_deg": hdg,
+        "수신시각": s.get("rcvDatetimeFormat"), "선종": s.get("shipType"),
+        "항해상태": s.get("status"), "목적지": s.get("destination"),
+        "여객선": "여객" in str(s.get("shipType") or "") or str(s.get("shipKind")) == "60",
+    }
+
+
+def _vms_position_safe(name):
+    """보고 흐름용 graceful 래퍼 — 키 없거나 조회 실패 시 None(다른 처리에 영향 없음)."""
+    if not (GICOMS_VMS_ID and GICOMS_VMS_PW and name):
+        return None
+    try:
+        return _vms_position(name)
+    except Exception as exc:
+        print(f"[vms] 실시간위치 조회 실패(무시): {exc}", flush=True)
+        return None
+
+
+def _vms_line(vpos):
+    """1차 속보용 'AIS 현재위치' 한 줄."""
+    bits = []
+    if vpos.get("속력_kn") is not None:
+        bits.append(f"{vpos['속력_kn']}kn")
+    if vpos.get("침로_deg") is not None:
+        bits.append(f"침로 {vpos['침로_deg']}°")
+    tail = (f" [{', '.join(bits)}]" if bits else "") + \
+           (f" · {vpos.get('수신시각')}" if vpos.get("수신시각") else "")
+    return f"▶ 현재위치(AIS): {vpos['위도']:.4f}, {vpos['경도']:.4f}{tail}"
+
+
+@app.get("/vessel_position")
+def vessel_position():
+    """선박명 → GICOMS VMS 실시간 위치(lat/lon/속력/침로/수신시각)."""
+    name = request.args.get("name", "").strip()
+    mmsi = request.args.get("mmsi", "").strip()
+    if not (name or mmsi):
+        return jsonify({"error": "name 또는 mmsi 파라미터가 필요합니다"}), 400
+    if not (GICOMS_VMS_ID and GICOMS_VMS_PW):
+        return jsonify({"error": "GICOMS_VMS_ID/PW가 설정되지 않았습니다"}), 503
+    try:
+        pos = _vms_position(name or None, mmsi or None)
+    except ImportError:
+        return jsonify({"error": "playwright 미설치 — pip install playwright && "
+                                 "python -m playwright install chromium"}), 503
+    except Exception as exc:
+        return jsonify({"error": f"VMS 조회 실패: {exc}"}), 502
+    if pos is None:
+        return jsonify({"error": "실시간 위치 없음(선박명 미일치 또는 AIS 미수신)"}), 404
+    return jsonify(pos)
 
 
 # ── 진입점 ──────────────────────────────────────────

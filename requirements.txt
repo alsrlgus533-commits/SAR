@@ -3,3 +3,4 @@ flask-cors>=4.0
 python-dotenv>=1.0
 pyhwpxlib>=0.18   # 정식 해양사고 보고서(hwpx) 생성 — 한글 오피스 불필요
 gunicorn>=21.0   # 클라우드(Linux) 운영용 WSGI 서버 — 로컬 Windows는 python backend.py 그대로
+playwright>=1.40 # GICOMS VMS 실시간 선박위치 로그인용(선택) — 설치 후 `python -m playwright install chromium` 필요. 미설치 시 /vessel_position만 503으로 graceful degradation

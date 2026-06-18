@@ -57,6 +57,17 @@
   - 환경변수: `MTIS_BASE`(선택, 기본 `https://mtis.komsa.or.kr`)
   - 주의: KOMSA 화면용 내부 주소라 사이트 개편 시 깨질 수 있음 — 운영 전환 시 정식 연계 권장
 
+### GICOMS VMS 실시간 선박위치 (allShipTarget)
+- 해양안전종합정보시스템(GICOMS)의 VMS 화면이 쓰는 내부 API `WEB_VMS/WebVMS/allShipTarget.json` 이 **전국 실시간 AIS(~7천척)** 를 한 번에 반환 — 각 선박에 `mmsi·shipName·latitude·longitude·sog·cog·heading·rcvDatetimeFormat·shipType` 등. (구버전 PUBDATA `pubdatareq`는 6개월 이상 과거 전용이라 부적합)
+- 백엔드 엔드포인트: `GET /vessel_position?name=<선박명>` 또는 `?mmsi=<MMSI>`
+- **로그인 필요**: GICOMS 로그인은 RSA 암호화(`jsbn`)+TouchEn nxKey/transkey라 단순 POST 불가 → **Playwright(헤드리스 크롬)로 로그인** 후 `JSESSIONID` 쿠키만 추출(`_vms_login`), 가벼운 `allShipTarget.json` 호출에 재사용(`_vms_all_targets`). 쿠키 25분 캐시·만료 시 자동 재로그인, 결과 20초 캐시
+  - 로그인 구현: 홈에서 `loginForm.id/password` 값을 JS로 세팅 후 `actionLogin('ID')` 호출(가시성 우회). **반드시 `http://www.gicoms.go.kr`** (https는 404)
+- **매칭(`_vms_position`)**: ① **권위목록(`선박명_MMSI.csv`)으로 한글명→MMSI 해석**(`_mmsi_map`) → ② MMSI 정확일치 → ③ 목록에 없으면 선박명 정규화('호'·공백 제거, 대문자) 정확일치 → ④ '여객' 선종에 한해서만 부분일치(화물선 오매칭 차단). AIS 원시단위 보정: `cog`/`sog`는 ×10(>360/>102.2면 ÷10), `heading=511`은 미지정(None)
+  - **VMS `shipName`은 여객선도 100% 영문/로마자**(`SEASTAR 1`,`ARION JEJU`)라 한국어 사고신고명과 직접 매칭 불가 → **회사 권위 목록 `선박명_MMSI.csv`(헤더 `선박명,MMSI[,선박번호]`, 비공개·`.gitignore`)** 로 한글명→MMSI를 확정해 **MMSI 정확조회**(이게 100% 정확). env `VESSEL_MMSI`로 경로 지정 가능, 5분 캐시. 목록 출처: 운항관리 관리대장(`선명,mmsi 목록.xlsx`의 '26년 현재' 시트)에서 추출
+- 환경변수: `GICOMS_VMS_ID`·`GICOMS_VMS_PW`(= GICOMS userId와 동일), `GICOMS_BASE`(선택, 기본 `http://www.gicoms.go.kr`)
+- 의존성: `playwright` + `python -m playwright install chromium`. 미설치/키 없음 시 `/vessel_position`만 503(다른 기능 영향 없음 — graceful degradation)
+- 주의: 내부 화면용 주소라 사이트 개편 시 깨질 수 있음 — 폴링 금지(사고 시에만 조회), 운영 전환 시 정식 연계 권장
+
 ## 카카오톡 챗봇 (카카오 i 오픈빌더 스킬 서버)
 
 - 백엔드 엔드포인트: `POST /kakao` — 카카오 i 오픈빌더 **스킬 서버(웹훅)**. 사고 자유텍스트 → 1차 속보 자동 작성
