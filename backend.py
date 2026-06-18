@@ -448,7 +448,14 @@ def _weather_lookup(loc: str, lat: str = "", lon: str = "") -> dict:
             f"https://apihub.kma.go.kr/api/typ01/url/sea_obs.php"
             f"?tm={tm}&stn=0&authKey={urllib.parse.quote(KMA_KEY, safe='')}"
         )
-        return http_get(url)
+        last = None
+        for attempt in range(3):                  # 기상청 일시 5xx/타임아웃 대비 재시도
+            try:
+                return http_get(url)
+            except Exception as exc:
+                last = exc
+                time.sleep(0.6 * (attempt + 1))
+        raise last
 
     try:
         text = fetch_obs(_tm_string(0))
@@ -1364,6 +1371,7 @@ def _build_report_text(utterance: str) -> str:
     lat, lon = _extract_latlon(loc)
     if lat is None and vpos and vpos.get("위도") is not None:   # 신고 좌표 없으면 AIS 현위치로 기상조회
         lat, lon = vpos["위도"], vpos["경도"]
+    have_coord = lat is not None
     wx = _weather_lookup(loc, "" if lat is None else str(lat), "" if lon is None else str(lon))
     if wx.get("error"):
         wx = None
@@ -1379,8 +1387,11 @@ def _build_report_text(utterance: str) -> str:
         if a and a.get("기온"):
             parts.append(f"기온 {a.get('기온')}")
         weather_line = f"▶ 기상: {wx.get('지점','')} " + ", ".join(parts)
+    elif have_coord:
+        # 위치는 확보(신고 좌표 또는 AIS)됐으나 기상청 연계가 일시 실패한 경우 — 위치 미상과 구분
+        weather_line = "▶ 기상: 해상관측 일시 연계 지연 — 잠시 후 다시 시도해 주세요"
     else:
-        weather_line = "▶ 기상: 위치 정보가 없어 해상관측을 특정하지 못했습니다"
+        weather_line = "▶ 기상: 위치 정보가 없어 해상관측을 특정하지 못했습니다 (사고 위치를 알려주시면 자동 조회됩니다)"
 
     L = ["🚨 해양사고 1차(속보) — 자동작성", ""]
 
@@ -2212,11 +2223,11 @@ def _mmsi_map():
     return m
 
 
-def _vms_position(name=None, mmsi=None):
+def _vms_position(name=None, mmsi=None, force_login=False):
     """선박명 또는 MMSI → 실시간 위치 dict. 없으면 None.
     매칭: ① 권위목록으로 한글명→MMSI 해석 ② MMSI 정확일치
     ③ 목록에 없으면 선박명 정규화 정확일치 ④ '여객' 선종만 부분일치(화물선 오매칭 차단)."""
-    items = _vms_all_targets()
+    items = _vms_all_targets(force_login=force_login)
     s = None
     if not mmsi and name:                          # 권위목록(CSV)으로 한글명→MMSI
         mmsi = _mmsi_map().get(_norm_ship(name))
@@ -2266,14 +2277,16 @@ def _vms_position(name=None, mmsi=None):
 
 
 def _vms_position_safe(name):
-    """보고 흐름용 graceful 래퍼 — 키 없거나 조회 실패 시 None(다른 처리에 영향 없음)."""
+    """보고 흐름용 graceful 래퍼 — 키 없거나 조회 실패 시 None(다른 처리에 영향 없음).
+    콜드스타트/쿠키만료로 첫 호출(로그인·조회)이 실패하면 재로그인 후 1회 재시도."""
     if not (GICOMS_VMS_ID and GICOMS_VMS_PW and name):
         return None
-    try:
-        return _vms_position(name)
-    except Exception as exc:
-        print(f"[vms] 실시간위치 조회 실패(무시): {exc}", flush=True)
-        return None
+    for attempt in range(2):
+        try:
+            return _vms_position(name, force_login=(attempt == 1))
+        except Exception as exc:
+            print(f"[vms] 실시간위치 조회 실패(시도 {attempt + 1}/2): {exc}", flush=True)
+    return None
 
 
 def _vms_line(vpos):
@@ -2283,9 +2296,11 @@ def _vms_line(vpos):
         bits.append(f"{vpos['속력_kn']}kn")
     if vpos.get("침로_deg") is not None:
         bits.append(f"침로 {vpos['침로_deg']}°")
+    rel = _rel_position(vpos.get("위도"), vpos.get("경도"))   # 가까운 기준점 기준 사람이 읽을 상대위치
+    head = f"{vpos['위도']:.4f}, {vpos['경도']:.4f}" + (f" ({rel})" if rel else "")
     tail = (f" [{', '.join(bits)}]" if bits else "") + \
            (f" · {vpos.get('수신시각')}" if vpos.get("수신시각") else "")
-    return f"▶ 현재위치(AIS): {vpos['위도']:.4f}, {vpos['경도']:.4f}{tail}"
+    return f"▶ 현재위치(AIS): {head}{tail}"
 
 
 @app.get("/vessel_position")
