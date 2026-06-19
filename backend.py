@@ -1716,6 +1716,67 @@ def _vessel_master(name: str = "", code: str = "") -> dict:
     return {}
 
 
+# ── KOMSA 공개 여객선 사진 (선박마스터에 사진이 없을 때 폴백) ──────
+# www.komsa.or.kr '여객선 정보' 목록(sub03_0204)은 선명별 사진을 공개한다.
+# searchKeyword=선명 으로 검색 → 목록 li의 썸네일 src(/thumbnail/psnShip/300_PS_*)에서
+# '300_' 접두어를 떼면 원본 고해상도 이미지를 받을 수 있다. 회사 선박마스터에 사진이
+# 없을 때만 폴백으로 사용(데이터 우선순위: 회사 선박마스터 > KOMSA 공개사진).
+_KOMSA_PHOTO_LIST = "https://www.komsa.or.kr/prog/psnShip/kor/sub03_0204/list.do"
+_KOMSA_PHOTO_BASE = "https://www.komsa.or.kr"
+_KOMSA_PHOTO_CACHE: dict = {}            # 선박명 → {"path": str|None, "at": float}
+_KOMSA_PHOTO_TTL = 3600                  # 1시간
+
+
+def _komsa_vessel_photo(name: str) -> str:
+    """KOMSA 공개 여객선 목록에서 선명으로 사진을 받아 임시파일 경로 반환(못 찾으면 "").
+    1시간 메모리 캐시(내려받은 임시파일 경로 보관). 네트워크/매칭 실패 시 graceful 빈 문자열."""
+    import time
+    name = (name or "").strip()
+    if not name:
+        return ""
+    now = time.time()
+    c = _KOMSA_PHOTO_CACHE.get(name)
+    if c and (now - c["at"]) < _KOMSA_PHOTO_TTL:
+        p = c["path"]
+        return p if (p and os.path.exists(p)) else ""
+    path = ""
+    try:
+        url = _KOMSA_PHOTO_LIST + "?searchKeyword=" + urllib.parse.quote(name)
+        req = urllib.request.Request(url, headers={"User-Agent": _MTIS_UA})
+        html = urllib.request.urlopen(req, timeout=15).read().decode("utf-8", "replace")
+        items = re.findall(
+            r'<img src="(/thumbnail/psnShip/[^"]+)"[^>]*>\s*</span>\s*'
+            r'<strong class="title">([^<]+)</strong>', html, re.S)
+        norm = lambda s: str(s or "").replace(" ", "").rstrip("호")
+        target = norm(name)
+        src = ""
+        for img, title in items:                      # 정규화(공백·끝 '호' 제거) 매칭
+            nt = norm(title)
+            if nt == target or (target and (target in nt or nt in target)):
+                src = img
+                break
+        if src:
+            full = src.replace("/300_", "/")           # 썸네일 접두어 제거 → 원본
+            for cand in (full, src):                   # 원본 실패 시 썸네일 폴백
+                try:
+                    breq = urllib.request.Request(
+                        _KOMSA_PHOTO_BASE + cand, headers={"User-Agent": _MTIS_UA})
+                    blob = urllib.request.urlopen(breq, timeout=20).read()
+                    if len(blob) > 1000:
+                        ext = os.path.splitext(cand)[1] or ".jpg"
+                        fd, path = tempfile.mkstemp(suffix=ext, prefix="komsa_photo_")
+                        with os.fdopen(fd, "wb") as f:
+                            f.write(blob)
+                        break
+                except Exception:
+                    continue
+    except Exception as exc:
+        print(f"[report] KOMSA 공개사진 조회 실패({name}): {exc}", flush=True)
+        path = ""
+    _KOMSA_PHOTO_CACHE[name] = {"path": path or None, "at": now}
+    return path or ""
+
+
 def _accident_type(summary: str, utterance: str) -> str:
     """사고개요·원문에서 공폼 사고종류(18종) 추정. 폴백 '기타'."""
     blob = f"{summary} {utterance}"
@@ -1941,13 +2002,15 @@ def _build_report_data(utterance: str, extra: dict = None, center: str = "") -> 
     cargo = (f"{cargo_mt} M/T" if cargo_mt else "") + (f" / 차량 {veh_n}대" if veh_n else "")
     cargo = cargo.strip(" /") or "없음"
 
-    # 선박사진 경로
+    # 선박사진 경로 — ① 회사 선박마스터 우선, ② 없으면 KOMSA 공개 여객선 사진
     photo = ""
     fn = str(master.get("사진파일명") or "").strip()
     if fn:
         p = fn if os.path.isabs(fn) else os.path.join(_VESSEL_PHOTO_DIR, fn)
         if os.path.exists(p):
             photo = p
+    if not photo and ship:
+        photo = _komsa_vessel_photo(ship)
 
     ph = "00"  # 공폼 자리표시자(미확보 항목)
     return {
