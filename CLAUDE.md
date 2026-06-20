@@ -83,7 +83,7 @@
 챗봇이 모은 데이터를 **운항관리센터 정식 서식(`해양사고 공폼.pdf`)** 에 맞춘 **hwpx 보고서**로 변환·다운로드한다.
 
 - 백엔드 엔드포인트: `POST /report/hwpx` — body `{ utterance, center, extra:{경위,피해,조치} }`. 응답은 hwpx 바이트(`Content-Disposition: attachment`). 프론트 ③단계 **`📄 정식 보고서(hwpx) 다운로드`** 버튼이 호출
-- **hwpx 생성 = `pyhwpxlib`(HwpxBuilder)로 직접 작성** — 한글 오피스/템플릿 파일 불필요. `_compose_report_hwpx()`가 제목·□사고개요·□선박제원(표, 라벨 음영·보험현황 병합)·□피해사항·□조치사항·□조치계획·사진·날짜를 공폼 순서대로 조립. 산출은 유효 hwpx(zip, `mimetype=application/hwp+zip`)
+- **hwpx 생성 = `pyhwpxlib`(HwpxBuilder)로 직접 작성** — 한글 오피스/템플릿 파일 불필요. `_compose_report_hwpx()`가 결재 박스(상단 우측)·제목·□사고개요·□선박제원(표, 1열 '선박사진' 칸·라벨 음영·보험현황 병합)·□피해사항·□조치사항·□조치계획·□사진(현장사진, 없으면 운항관리자가 삭제)·날짜를 공폼 순서대로 조립. 저장 후 `_postprocess_report_hwpx()`가 결재 박스 우측정렬 + 선박사진을 선박제원 표 셀로 이동(XML 후처리, pyhwpxlib 미지원 보정). 산출은 유효 hwpx(zip, `mimetype=application/hwp+zip`)
 - **데이터 우선순위: 회사 선박마스터 > KOMSA/MTIS > LLM 추정 > 공폼 자리표시자(`00`/`확인 중`/`없음`)** — `_build_report_data()`가 `_parse_nl`·`_vessel_lookup`·`_route_lookup`·`_predep_lookup`·`_weather_lookup`(기존 재사용) + `_vessel_master` + `_infer_report_fields`를 병합
   - `_vessel_master(name, code)`: `선박마스터.csv`(UTF-8, 헤더 `선박명,선박코드,보험현황,선박번호,선적항,검사기관,국적,사진파일명`)에서 보험·선박번호·선적항·검사기관·국적·사진을 조회(5분 캐시, 없으면 graceful 빈 dict). 키는 선박코드 우선, 다음 선박명(부분일치 폴백)
   - 사진: ① 회사 `vessel_photos/<사진파일명>`(jpg/png) 우선 → ② 없으면 **KOMSA 공개 여객선 사진** 폴백(`_komsa_vessel_photo`). 표 위에 삽입, 둘 다 없으면 생략

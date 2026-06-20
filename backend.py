@@ -660,6 +660,7 @@ def _predep_lookup(cd: str, name: str = "", de: str = "", tm: str = ""):
         "출항일": str(o.get("sloffDe", "")),
         "출항시간": str(o.get("sloffTime", "")),
         "화물적재중량": str(o.get("realFrghtLoadngWt", "")),
+        "화물적재한도": str(o.get("frghtLoadngLmtWtDc", "")),   # 운항관리규정상 적재한도(M/T)
         "차량": num("vhcleFrghtCo"),
     }
 
@@ -1448,9 +1449,10 @@ def _build_report_text(utterance: str) -> str:
         tmp = f", 임시승선자 {mtis['임시승선자']}명" if mtis.get("임시승선자") else ""
         L.append(f"▶ 승선: 여객 {mtis['여객']}명{detail}, 선원 {mtis['승무원']}명{tmp} "
                  f"(실승선 계 {mtis['실제승선인원']}명)")
-        cargo, veh = mtis.get("화물적재중량", ""), mtis.get("차량", 0)
+        cargo, lmt, veh = mtis.get("화물적재중량", ""), mtis.get("화물적재한도", ""), mtis.get("차량", 0)
         cargo_txt = " · ".join(x for x in (
             f"적재 {cargo} M/T" if cargo else "",
+            f"적재한도 {lmt} M/T" if lmt else "",
             f"차량 {veh}대" if veh else "",
         ) if x)
         if cargo_txt:
@@ -1997,10 +1999,17 @@ def _build_report_data(utterance: str, extra: dict = None, center: str = "") -> 
         "summary": summary,
     })
 
-    # 화물
+    # 화물 — 실제 적재량 + 운항관리규정상 적재한도(MTIS 출항전 점검표) 병기
+    def _fmt_mt(s):
+        try:
+            return f"{float(s):,.1f}".rstrip("0").rstrip(".")
+        except (TypeError, ValueError):
+            return str(s).strip()
+    # 선박제원 화물칸 = 운항관리규정상 적재한도 값만 표출(다른 글자 없이). 없으면 실제 적재량 폴백.
+    cargo_lmt = str((mtis or {}).get("화물적재한도") or "").strip()
     cargo_mt = str((mtis or {}).get("화물적재중량") or "").strip()
-    cargo = (f"{cargo_mt} M/T" if cargo_mt else "") + (f" / 차량 {veh_n}대" if veh_n else "")
-    cargo = cargo.strip(" /") or "없음"
+    cargo_val = cargo_lmt or cargo_mt
+    cargo = f"{_fmt_mt(cargo_val)} M/T" if cargo_val else "없음"
 
     # 선박사진 경로 — ① 회사 선박마스터 우선, ② 없으면 KOMSA 공개 여객선 사진
     photo = ""
@@ -2042,12 +2051,127 @@ def _build_report_data(utterance: str, extra: dict = None, center: str = "") -> 
     }
 
 
+def _img_size(path: str):
+    """JPEG/PNG 파일의 (가로, 세로) 픽셀을 외부 라이브러리 없이 읽음. 실패 시 (0, 0).
+    선박사진을 표 셀에 넣을 때 종횡비 왜곡을 막기 위해 실제 비율 산정에 사용."""
+    import struct
+    try:
+        with open(path, "rb") as f:
+            head = f.read(26)
+            if head[:8] == b"\x89PNG\r\n\x1a\n":
+                w, h = struct.unpack(">II", head[16:24])
+                return w, h
+            if head[:2] == b"\xff\xd8":               # JPEG: SOF 마커에서 치수
+                f.seek(2)
+                while True:
+                    byte = f.read(1)
+                    while byte and byte != b"\xff":
+                        byte = f.read(1)
+                    marker = f.read(1)
+                    while marker == b"\xff":
+                        marker = f.read(1)
+                    if not marker:
+                        break
+                    if marker[0] in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6,
+                                     0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
+                        f.read(3)                     # length(2) + precision(1)
+                        h, w = struct.unpack(">HH", f.read(4))
+                        return w, h
+                    ln = struct.unpack(">H", f.read(2))[0]
+                    f.seek(ln - 2, 1)
+    except Exception:
+        pass
+    return 0, 0
+
+
+def _postprocess_report_hwpx(hwpx_path: str) -> None:
+    """저장된 hwpx를 공폼 서식에 맞게 XML 후처리(pyhwpxlib 미지원 항목 보정). 실패 시 조용히 통과.
+    ① 결재 박스 표를 상단 우측 정렬(공폼처럼) — 우측정렬 문단(기준 일시)의 paraPrIDRef 재사용
+    ② 선박사진(floating 그림)을 선박제원 표 좌측 첫 셀('선박사진' 칸) 안으로 이동(표 셀 이미지 미지원)."""
+    import zipfile
+    from lxml import etree
+    try:
+        with zipfile.ZipFile(hwpx_path, "r") as zin:
+            names = zin.namelist()
+            sec = "Contents/section0.xml"
+            if sec not in names:
+                return
+            entries = {n: zin.read(n) for n in names}
+
+        root = etree.fromstring(entries[sec])
+        HP = root.nsmap.get("hp")
+        if not HP:
+            return
+        q = lambda t: f"{{{HP}}}{t}"
+        text_of = lambda el: "".join(el.itertext())
+
+        def _wrapping_p(node):
+            p = node.getparent()
+            while p is not None and etree.QName(p).localname != "p":
+                p = p.getparent()
+            return p
+
+        # ① 결재 박스(텍스트 '결재', 선박제원 표 아님)를 우측 정렬
+        try:
+            appr_tbl = next((t for t in root.iter(q("tbl"))
+                             if "결재" in text_of(t) and "총톤수" not in text_of(t)), None)
+            if appr_tbl is not None:
+                right_id = None              # 우측정렬 문단(기준 일시 줄)의 paraPr id 차용
+                for p in root.iter(q("p")):
+                    if "기준 일시" in "".join(p.itertext()):
+                        right_id = p.get("paraPrIDRef")
+                        break
+                ap = _wrapping_p(appr_tbl)
+                if right_id and ap is not None:
+                    ap.set("paraPrIDRef", right_id)
+        except Exception as exc:
+            print(f"[report] 결재 박스 정렬 실패: {exc}", flush=True)
+
+        # ② 선박사진 → 선박제원 표('총톤수' 포함) 좌측 첫 셀로 이동
+        try:
+            target_tbl = next((t for t in root.iter(q("tbl"))
+                               if "총톤수" in text_of(t)), None)
+            pic = next(iter(root.iter(q("pic"))), None)
+            if target_tbl is not None and pic is not None:
+                run = pic.getparent()        # pic의 run(이미지 run)을 찾아 셀로 이동
+
+                while run is not None and etree.QName(run).localname != "run":
+                    run = run.getparent()
+                if run is not None:
+                    src_p = run.getparent()
+                    first_tc = target_tbl.find(f".//{q('tc')}")
+                    cell_p = first_tc.find(f".//{q('p')}") if first_tc is not None else None
+                    if cell_p is not None:
+                        cell_p.append(run)   # lxml: 트리 간 이동(원래 위치에서 제거됨)
+                        if src_p is not None and src_p.getparent() is not None:
+                            src_p.getparent().remove(src_p)
+        except Exception as exc:
+            print(f"[report] 사진 셀 삽입 실패(그림은 표 위 유지): {exc}", flush=True)
+
+        entries[sec] = etree.tostring(root, xml_declaration=True,
+                                      encoding="UTF-8", standalone=True)
+        with zipfile.ZipFile(hwpx_path, "w", zipfile.ZIP_DEFLATED) as zout:
+            if "mimetype" in entries:    # hwpx 규약: mimetype 먼저·무압축
+                zout.writestr("mimetype", entries.pop("mimetype"), zipfile.ZIP_STORED)
+            for n, d in entries.items():
+                zout.writestr(n, d)
+    except Exception as exc:
+        print(f"[report] hwpx 후처리 실패: {exc}", flush=True)
+
+
 def _compose_report_hwpx(data: dict) -> bytes:
     """공폼 서식 hwpx 생성 → 바이트 반환. pyhwpxlib 필요(미설치 시 ImportError 전파)."""
     from pyhwpxlib import HwpxBuilder
 
     H1, H2 = 16, 12   # 제목 / 항목 글자크기(pt)
     b = HwpxBuilder()
+    # 결재 박스(공폼 상단 우측) — 후처리(_postprocess_report_hwpx)에서 우측 정렬
+    try:
+        b.add_table([["", "", "결재"]], width=11000, col_widths=[4500, 4500, 2000],
+                    row_heights=[2200],
+                    cell_aligns={(0, 0): "CENTER", (0, 1): "CENTER", (0, 2): "CENTER"})
+    except Exception:
+        pass
     # 제목: 공폼 형식 "(○○호 사고종류) 사고 보고" — 선박명 + 사고종류
     ship_title = data["선명"] if data.get("선명") and data["선명"] != "00" else "○○호"
     b.add_paragraph(f"({ship_title} {data['사고종류']}) 사고 보고", bold=True, font_size=H1, alignment="CENTER")
@@ -2056,35 +2180,57 @@ def _compose_report_hwpx(data: dict) -> bytes:
     b.add_paragraph("")
 
     b.add_paragraph("□ 사고개요", bold=True, font_size=H2)
-    b.add_paragraph(data["사고개요"])
+    b.add_table([[data["사고개요"]]], header_bg="",          # 공폼: 사고개요는 네모 박스(1칸 표)
+                cell_styles={(0, 0): {"text_color": "#000000", "bold": False}},
+                cell_aligns={(0, 0): "LEFT"})
     b.add_paragraph(f"** 현지기상 : {data['현지기상']}")
 
     b.add_paragraph("□ 선박제원", bold=True, font_size=H2)
+    photo_h = 0                                            # 사진칸 높이 맞춤용
+    cm = (getattr(b, "_table_preset", None) or {}).get("cell_margin", (283, 283, 200, 200))
+    inner_w = 11000 - cm[0] - cm[1]                        # 1열 폭 - 셀 좌우 여백 = 사진 최대 가로
+    vpad = cm[2] + cm[3]                                   # 셀 상하 여백
     if data.get("사진경로"):
         try:
-            b.add_image(data["사진경로"], width=12000, height=8000)
+            iw, ih = _img_size(data["사진경로"])           # 실제 비율로 크기 산정(왜곡 방지)
+            W = inner_w                                    # 1열 폭 가로 꽉 채움
+            if iw and ih:
+                H = max(1, round(ih * W / iw))
+                if H > 8000:                               # 세로가 너무 길면 높이 기준 축소(가로 여백 허용)
+                    H = 8000
+                    W = max(1, round(iw * H / ih))
+            else:
+                H = 6000
+            b.add_image(data["사진경로"], width=W, height=H)
+            photo_h = H
         except Exception as exc:
             print(f"[report] 선박사진 삽입 실패: {exc}", flush=True)
     # 공폼 서식: 6열 그리드 — 1열은 선박사진(세로 병합), 2개 라벨행(음영) + 2개 데이터행
+    spec_label = "" if data.get("사진경로") else "선박사진"   # 사진 있으면 사진이 칸을 채움
     rows = [
-        ["선박사진", "선 명", "총톤수", "선 종", "승무정원", "소유자 또는\n선박회사"],
+        [spec_label, "선 명", "총톤수", "선 종", "승무정원", "소유자 또는\n선박회사"],   # 1열=사진칸
         ["", "선박번호", "화물", "선적항", "국적", "검사기관"],
         ["", data["선명"], data["총톤수"], data["선종"], data["승무정원"], data["소유자"]],
         ["", data["선박번호"], data["화물"], data["선적항"], data["국적"], data["검사기관"]],
     ]
     merge_info = [(0, 0, 3, 0)]   # 1열(선박사진) 4행 세로 병합
-    # 라벨행(0·1행)과 선박사진 라벨 셀 음영
-    label_bg = {(0, 0): "#EFEFEF"}
-    label_bg.update({(0, c): "#EFEFEF" for c in range(1, 6)})
+    label_bg = {(0, c): "#EFEFEF" for c in range(1, 6)}
     label_bg.update({(1, c): "#EFEFEF" for c in range(1, 6)})
+    # 라벨 글자 검정(프리셋이 머리행 글자를 흰색으로 넣어 안 보이던 문제 해결)
+    cell_styles = {(0, c): {"text_color": "#000000", "bold": True} for c in range(1, 6)}
+    cell_styles.update({(1, c): {"text_color": "#000000", "bold": True} for c in range(1, 6)})
     cell_aligns = {(r, c): "CENTER" for r in range(4) for c in range(6)}
     col_widths = [11000, 6300, 6300, 6300, 6300, 6320]   # 합 42520 = A4 본문폭
+    # 4행 합 = 사진 높이 + 셀 상하 여백 → 사진이 칸을 세로로 꽉 채움
+    rh = max(850, round((photo_h + vpad) / 4)) if photo_h else 1500
+    row_heights = [rh, rh, rh, rh]
     try:
         b.add_table(rows, cell_colors=label_bg, merge_info=merge_info,
-                    cell_aligns=cell_aligns, col_widths=col_widths)
+                    cell_aligns=cell_aligns, cell_styles=cell_styles,
+                    col_widths=col_widths, row_heights=row_heights)
     except Exception:
         b.add_table(rows)
-    b.add_paragraph(f"** 보험 현황 : {data['보험현황']}")   # 공폼: 표 아래 별도 줄
+    b.add_paragraph(f"** 보험 현황 : {data['보험현황']}", font_size=8)   # 한 줄에 들어가도록 축소
 
     b.add_paragraph("□ 피해사항", bold=True, font_size=H2)
     b.add_bullet_list([f"인명 : {data['인명피해']}", f"오염 : {data['오염피해']}",
@@ -2098,6 +2244,9 @@ def _compose_report_hwpx(data: dict) -> bytes:
     b.add_paragraph("□ 조치계획", bold=True, font_size=H2)
     b.add_bullet_list(data["조치계획"] or ["확인 중"], bullet_char="ㅇ")
 
+    # 공폼 마지막 항목: 사고현장 사진(없으면 운항관리자가 항목 삭제)
+    b.add_paragraph("□ 사진 (필요시 추가, 없으면 항목 삭제)", bold=True, font_size=H2)
+
     b.add_paragraph("")
     b.add_paragraph(data["작성일자"], alignment="CENTER")
 
@@ -2105,6 +2254,7 @@ def _compose_report_hwpx(data: dict) -> bytes:
     os.close(fd)
     try:
         b.save(path)
+        _postprocess_report_hwpx(path)           # 결재 박스 우측정렬 + 사진을 선박제원 표 셀로 이동(공폼식)
         with open(path, "rb") as f:
             return f.read()
     finally:
