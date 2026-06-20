@@ -751,7 +751,7 @@ def _gemini_generate(prompt: str, max_tokens: int = 256) -> str:
     url = (f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
            f"?key={urllib.parse.quote(GEMINI_KEY, safe='')}")
     req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with urllib.request.urlopen(req, timeout=12) as resp:   # 보고서 tail latency 제한(초과 시 규칙 폴백)
         data = json.loads(resp.read().decode("utf-8"))
     parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
     return "".join(p.get("text", "") for p in parts)
@@ -767,7 +767,7 @@ def _claude_generate(prompt: str, max_tokens: int = 256) -> str:
         "https://api.anthropic.com/v1/messages", data=payload,
         headers={"Content-Type": "application/json", "x-api-key": ANTHROPIC_KEY,
                  "anthropic-version": "2023-06-01"}, method="POST")
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with urllib.request.urlopen(req, timeout=12) as resp:   # 보고서 tail latency 제한(초과 시 규칙 폴백)
         data = json.loads(resp.read().decode("utf-8"))
     return "".join(c["text"] for c in data.get("content", []) if c.get("type") == "text")
 
@@ -2385,7 +2385,8 @@ def _kakao_hwpx_callback(callback_url: str, uid: str, utterance: str, base: str)
 # 가벼운 allShipTarget.json(전국 실시간 AIS) 호출에 재사용. 쿠키 만료 시 자동 재로그인.
 
 _VMS = {"cookie": None, "at": None}          # JSESSIONID 캐시
-_VMS_LOCK = threading.Lock()
+_VMS_LOCK = threading.Lock()                  # 캐시 읽기/쓰기 보호(짧게만 점유)
+_VMS_LOGIN_LOCK = threading.Lock()            # 로그인 직렬화(중복 로그인 방지) — 로그인 중 신선쿠키 읽기는 비차단
 _VMS_TARGETS = {"at": None, "items": []}     # allShipTarget 파싱결과 단기 캐시
 _VMS_COOKIE_TTL = 1500                        # 25분
 _VMS_TARGETS_TTL = 20                         # 20초
@@ -2422,15 +2423,31 @@ def _vms_login():
             browser.close()
 
 
-def _vms_cookie(force=False):
-    """캐시된 세션 쿠키 반환(없거나 만료/force면 재로그인). 동시 로그인 방지 락."""
+def _fresh_cookie():
+    """캐시 쿠키가 신선하면 반환, 아니면 None (짧게 락)."""
     with _VMS_LOCK:
-        fresh = (_VMS["cookie"] and _VMS["at"]
-                 and (datetime.now() - _VMS["at"]).total_seconds() < _VMS_COOKIE_TTL)
-        if force or not fresh:
-            _VMS["cookie"] = _vms_login()
-            _VMS["at"] = datetime.now()
-        return _VMS["cookie"]
+        if (_VMS["cookie"] and _VMS["at"]
+                and (datetime.now() - _VMS["at"]).total_seconds() < _VMS_COOKIE_TTL):
+            return _VMS["cookie"]
+    return None
+
+
+def _vms_cookie(force=False):
+    """세션 쿠키 반환. 신선하면 즉시 반환(읽기 비차단). 로그인이 필요할 때만 로그인 락으로 직렬화 —
+    워머의 선제 갱신(force) 중에도 신선한 쿠키 읽기는 대기하지 않는다(Chromium 로그인을 _VMS_LOCK 밖에서 수행)."""
+    if not force:
+        c = _fresh_cookie()
+        if c:
+            return c
+    with _VMS_LOGIN_LOCK:                      # 로그인은 한 번에 하나
+        if not force:                          # 락 대기 중 다른 스레드가 갱신했을 수 있음 — 재확인
+            c = _fresh_cookie()
+            if c:
+                return c
+        cookie = _vms_login()                  # _VMS_LOCK 밖에서 로그인 → 신선쿠키 읽기 비차단
+        with _VMS_LOCK:
+            _VMS["cookie"], _VMS["at"] = cookie, datetime.now()
+        return cookie
 
 
 def _vms_all_targets(force_login=False):
@@ -2608,7 +2625,7 @@ def _vms_warm_loop():
     interval = max(60, _VMS_COOKIE_TTL - 120)   # 쿠키 만료 2분 전 선제 갱신
     while True:
         try:
-            _vms_cookie()
+            _vms_cookie(force=True)              # force=True여야 신선쿠키도 선제 재로그인(만료 래스 방지)
         except Exception as exc:
             print(f"[vms] 쿠키 워밍 실패(다음 주기 재시도): {exc}", flush=True)
         time.sleep(interval)
