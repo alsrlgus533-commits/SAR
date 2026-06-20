@@ -1544,14 +1544,14 @@ def _post_callback(callback_url: str, payload: dict):
         print(f"[kakao] 콜백 전송 실패: {exc}", flush=True)
 
 
-def _kakao_callback(callback_url: str, utterance: str, uid: str = "anon"):
-    """백그라운드: 보고서 작성 후 카카오 콜백 URL로 결과 전송."""
+def _kakao_callback(callback_url: str, utterance: str, uid: str = "anon", prefix: str = ""):
+    """백그라운드: 보고서 작성 후 카카오 콜백 URL로 결과 전송. prefix는 복구 안내 등 1회성 머리말."""
     try:
         text = _build_report_text(utterance)
     except Exception as exc:
         text = f"보고서 자동작성 중 오류가 발생했습니다: {exc}"
-    _session_set(uid, report=text, utterance=utterance, mode=None)
-    _post_callback(callback_url, _kakao_report(text))
+    _session_set(uid, report=text, utterance=utterance, mode=None)  # 저장은 prefix 제외(수정 시 오염 방지)
+    _post_callback(callback_url, _kakao_report((prefix + text) if prefix else text))
 
 
 def _kakao_edit_callback(callback_url: str, uid: str, field: str, report: str, instruction: str):
@@ -1649,20 +1649,34 @@ def kakao_skill():
         _session_set(uid, report=rep, mode=None)
         return jsonify(_kakao_report(rep))
 
-    # ④ 새 사고 — 콜백(비동기) 처리
+    # ④ 새 사고 — 외부 API 건강검진 기반 가용성 안내(장애면 차단, 복구 후 첫 사용이면 정상 안내)
+    _health_maybe_refresh()                       # 건강상태가 오래됐으면 백그라운드 갱신(논블로킹)
+    _down = _health_down_critical()
+    if _down:
+        _session_set(uid, outage_seen=True)
+        return jsonify(_kakao_text(
+            "⚠️ 현재 외부 연계 시스템(" + "·".join(_down) + ") 장애로\n"
+            "신속보고 자동작성을 일시적으로 사용할 수 없습니다.\n"
+            "잠시 후 다시 시도해 주세요. (복구되면 정상 이용 안내가 표시됩니다)"))
+    prefix = _RECOVER_MSG if sess.get("outage_seen") else ""   # 장애를 겪었던 사용자에게 1회 복구 안내
+    if prefix:
+        _session_set(uid, outage_seen=False)
+
+    # ④-a 콜백(비동기) 처리
     if callback_url:
         _session_set(uid, mode=None)
-        threading.Thread(target=_kakao_callback, args=(callback_url, utterance, uid), daemon=True).start()
+        threading.Thread(target=_kakao_callback,
+                         args=(callback_url, utterance, uid, prefix), daemon=True).start()
         return jsonify({
             "version": "2.0",
             "useCallback": True,
             "data": {"text": "🚨 사고 정보를 분석 중입니다… 잠시만 기다려 주세요."},
         })
-    # 콜백 미설정 폴백: 동기 처리(외부 API 지연 시 5초 초과 가능)
+    # ④-b 콜백 미설정 폴백: 동기 처리(외부 API 지연 시 5초 초과 가능)
     try:
         text = _build_report_text(utterance)
         _session_set(uid, report=text, utterance=utterance, mode=None)
-        return jsonify(_kakao_report(text))
+        return jsonify(_kakao_report(prefix + text if prefix else text))
     except Exception as exc:
         return jsonify(_kakao_text(f"보고서 자동작성 중 오류가 발생했습니다: {exc}"))
 
@@ -2698,6 +2712,191 @@ def _start_vms_warmer():
 
 
 _start_vms_warmer()
+
+
+# ── 외부 API 자동 건강검진 ───────────────────────────
+# 남의 사이트(KOMSA·기상청·MTIS·GICOMS)에 의존하므로, 사이트 개편 등으로 조용히 깨지면
+# 사고 당일에야 발견된다. 백그라운드 데몬이 하루 1회 각 외부 API에 가벼운 스모크 호출을 보내
+# 생존을 확인하고, 실패/복구 시 로그(+선택적 웹훅)로 알린다.
+# ※ VMS는 로그인 쿠키 확보만 확인하고 allShipTarget(AIS)은 호출하지 않음 → '사고 시에만 AIS 조회' 원칙 유지.
+
+_HEALTH = {"at": None, "results": {}, "ok": None}                    # 최근 검진 결과 캐시
+_HEALTH_INTERVAL = int(os.environ.get("HEALTH_INTERVAL", "86400"))   # 기본 24시간
+_HEALTH_FIRST_DELAY = int(os.environ.get("HEALTH_FIRST_DELAY", "60"))  # 기동 후 첫 검진 지연(부하 회피)
+_HEALTH_WEBHOOK = os.environ.get("HEALTH_WEBHOOK_URL", "")           # 선택: 실패/복구 알림(Slack 호환 {"text":...})
+
+# 챗봇 가용성 안내용 — 핵심 외부 API가 장애면 사용자에게 '일시 사용 불가'를 알린다.
+_CRITICAL_CHECKS = ("KOMSA_제원", "기상청_해상관측")                   # 신속보고에 필수적인 외부 API
+_HEALTH_BANNER_TTL = int(os.environ.get("HEALTH_BANNER_TTL", "300"))  # 챗봇 사용 중 허용하는 건강상태 신선도(초)
+_RECOVER_MSG = "✅ 시스템이 정상 복구되어 현재 정상 이용 가능합니다.\n\n"
+_health_refreshing = threading.Lock()
+
+
+def _health_down_critical() -> list:
+    """건강검진 캐시 기준, 핵심 외부 API 중 장애 목록. 검진 이력 없으면 빈 목록(차단하지 않음)."""
+    res = _HEALTH.get("results") or {}
+    return [n for n in _CRITICAL_CHECKS if (res.get(n) or {}).get("ok") is False]
+
+
+def _health_maybe_refresh():
+    """챗봇 요청 시 건강상태가 오래됐으면(>TTL) 백그라운드로 1회 갱신(논블로킹·중복방지).
+    이 요청 자체는 현재 캐시값을 쓰고, 갱신 결과는 다음 요청부터 반영된다."""
+    if os.environ.get("HEALTH_CHECK", "1") == "0":
+        return
+    at = _HEALTH.get("at")
+    if at and (datetime.now() - at).total_seconds() < _HEALTH_BANNER_TTL:
+        return
+    if not _health_refreshing.acquire(blocking=False):
+        return
+
+    def job():
+        try:
+            _health_run()
+        except Exception as exc:
+            print(f"[health] 온디맨드 갱신 오류: {exc}", flush=True)
+        finally:
+            _health_refreshing.release()
+
+    threading.Thread(target=job, name="health-refresh", daemon=True).start()
+
+
+def _health_checks() -> dict:
+    """각 외부 API에 가벼운 스모크 호출(병렬). {이름: {ok, detail}} 반환.
+    ok=True 정상 / ok=False 장애 / ok=None 키 미설정으로 건너뜀. 예외는 잡아서 ok=False."""
+
+    def komsa_spec():
+        if not KOMSA_KEY:
+            return None, "KOMSA_KEY 미설정(건너뜀)"
+        r = _vessel_lookup("한라호")                # 예외=장애, None=정상응답(샘플 미일치)
+        return True, ("조회 정상" if r else "응답 정상(샘플 미일치)")
+
+    def komsa_route():
+        if not KOMSA_KEY:
+            return None, "KOMSA_KEY 미설정(건너뜀)"
+        _route_lookup("한라호")
+        return True, "응답 정상"
+
+    def kma_weather():
+        if not KMA_KEY:
+            return None, "KMA_KEY 미설정(건너뜀)"
+        r = _weather_lookup("해상", lat="34.4", lon="128.4")  # 좌표 직접 지정 → KMA만 검사(지오코딩 우회)
+        if r.get("error"):
+            return False, r.get("error")
+        return True, ("캐시 폴백(일시 지연)" if r.get("_stale")
+                      else f"부이 {r.get('지점', '?')} 관측 정상")
+
+    def mtis_predep():                              # 익명 세션+CSRF 토큰 확보만으로 생존 확인(로그인 불필요)
+        _mtis_post("selectQrForSfcstDeInfo", {"psnshpCd": "", "psnshpNm": "", "shipNo": ""})
+        return True, "세션·CSRF 정상"
+
+    def gicoms_vms():
+        if not (GICOMS_VMS_ID and GICOMS_VMS_PW):
+            return None, "GICOMS_VMS_ID/PW 미설정(건너뜀)"
+        c = _vms_cookie(force=False)                # 로그인 쿠키 확보만(allShipTarget 미호출)
+        return bool(c), ("로그인 세션 정상" if c else "쿠키 없음")
+
+    funcs = {
+        "KOMSA_제원": komsa_spec, "KOMSA_항로": komsa_route,
+        "기상청_해상관측": kma_weather, "MTIS_출항전점검": mtis_predep,
+        "GICOMS_VMS로그인": gicoms_vms,
+    }
+    checks = {}
+    with ThreadPoolExecutor(max_workers=len(funcs)) as ex:
+        futs = {name: ex.submit(fn) for name, fn in funcs.items()}
+        for name, fut in futs.items():
+            try:
+                ok, detail = fut.result(timeout=60)
+            except Exception as exc:
+                ok, detail = False, str(exc)
+            checks[name] = {"ok": ok, "detail": detail}
+    return checks
+
+
+def _health_notify(text: str):
+    """선택적 웹훅 알림(Slack 호환). HEALTH_WEBHOOK_URL 미설정이면 조용히 무시."""
+    if not _HEALTH_WEBHOOK:
+        return
+    try:
+        host = os.environ.get("HOSTNAME") or ""
+        body = json.dumps(
+            {"text": f"[해양사고 신속보고] {text}" + (f" @{host}" if host else "")},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        req = urllib.request.Request(_HEALTH_WEBHOOK, data=body,
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        urllib.request.urlopen(req, timeout=15)
+    except Exception as exc:
+        print(f"[health] 웹훅 통지 실패: {exc}", flush=True)
+
+
+def _health_run() -> dict:
+    """검진 1회 실행 → 결과 캐시 + 로그. 실패 시, 그리고 실패→정상 복구 시 웹훅 통지."""
+    results = _health_checks()
+    fails = [n for n, r in results.items() if r["ok"] is False]
+    ok = not fails
+    prev_ok = _HEALTH["ok"]
+    _HEALTH["at"], _HEALTH["results"], _HEALTH["ok"] = datetime.now(), results, ok
+
+    for name, r in results.items():
+        mark = "✅" if r["ok"] else ("⏭️" if r["ok"] is None else "❌")
+        print(f"[health] {mark} {name}: {r['detail']}", flush=True)
+    if ok:
+        print("[health] 외부 API 전체 정상", flush=True)
+        if prev_ok is False:                        # 실패→정상 복구만 통지
+            _health_notify("✅ 외부 API 복구: 전체 정상으로 돌아왔습니다.")
+    else:
+        msg = "외부 API 점검 실패 — " + ", ".join(
+            f"{n}({results[n]['detail']})" for n in fails)
+        print("[health] ❌ " + msg, flush=True)
+        _health_notify("❌ " + msg)
+    return results
+
+
+def _health_loop():
+    time.sleep(max(0, _HEALTH_FIRST_DELAY))         # 기동 직후 부하 회피
+    while True:
+        try:
+            _health_run()
+        except Exception as exc:
+            print(f"[health] 검진 루프 오류(다음 주기 재시도): {exc}", flush=True)
+        time.sleep(max(300, _HEALTH_INTERVAL))
+
+
+def _start_health_checker():
+    """모듈 로드 시 시작. HEALTH_CHECK=0이면 비활성. gunicorn 다중 워커에서는
+    localhost 락 포트 바인딩으로 1개 워커만 검진(중복 알림 방지)."""
+    if os.environ.get("HEALTH_CHECK", "1") == "0":
+        return
+    import socket
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", int(os.environ.get("HEALTH_LOCK_PORT", "8401"))))
+    except OSError:
+        return                                      # 다른 워커가 이미 검진 담당 → 조용히 양보
+    sock.listen(1)
+    globals()["_HEALTH_LOCK_SOCK"] = sock           # GC로 닫히지 않게 모듈에 보관
+    threading.Thread(target=_health_loop, name="health-checker", daemon=True).start()
+    print(f"[health] 외부 API 건강검진 시작(주기 {_HEALTH_INTERVAL}s, "
+          f"첫 검진 {_HEALTH_FIRST_DELAY}s 후)", flush=True)
+
+
+@app.get("/health/external")
+def health_external():
+    """외부 API 건강검진 상태(JSON). ?run=1 이면 즉시 1회 실행 후 반환."""
+    if request.args.get("run") == "1" or not _HEALTH["results"]:
+        results = _health_run()
+    else:
+        results = _HEALTH["results"]
+    fails = [n for n, r in results.items() if r["ok"] is False]
+    return jsonify({
+        "ok": not fails,
+        "checked_at": _HEALTH["at"].isoformat() if _HEALTH["at"] else None,
+        "fails": fails,
+        "results": results,
+    }), (200 if not fails else 503)
+
+
+_start_health_checker()
 
 
 if __name__ == "__main__":

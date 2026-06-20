@@ -69,6 +69,14 @@
 - 의존성: `playwright` + `python -m playwright install chromium`. 미설치/키 없음 시 `/vessel_position`만 503(다른 기능 영향 없음 — graceful degradation)
 - 주의: 내부 화면용 주소라 사이트 개편 시 깨질 수 있음 — AIS 선박위치 폴링 금지(사고 시에만 조회; 워머는 쿠키만 갱신), 운영 전환 시 정식 연계 권장
 
+### 외부 API 자동 건강검진 (daily health check)
+- 외부 시스템(KOMSA·기상청·MTIS·GICOMS)이 사이트 개편 등으로 **조용히 깨지면 사고 당일에야 발견**되는 문제를 막기 위해, 백그라운드 데몬이 **하루 1회** 각 외부 API에 가벼운 스모크 호출을 보내 생존을 확인한다(`_health_loop`/`_start_health_checker`, `_vms_warm_loop` 패턴 차용)
+- 검진 항목(`_health_checks`, **병렬 실행**): KOMSA 제원(`_vessel_lookup`)·항로(`_route_lookup`)·기상청 해상관측(`_weather_lookup`, 좌표 직접지정으로 지오코딩 우회·KMA만 검사)·MTIS 출항전점검(`_mtis_post`로 익명 세션+CSRF 확보만)·GICOMS VMS(`_vms_cookie`로 **로그인 쿠키 확보만 확인**, `allShipTarget`(AIS) 미호출 → '사고 시에만 AIS 조회' 원칙 유지). 각 항목 `ok=True 정상 / False 장애 / None 키미설정 건너뜀`, 예외는 잡아서 장애 처리
+- **알림(`_health_notify`)**: 매 검진 결과를 `[health]` 로그(systemd 저널)에 남기고, **실패 시 + 실패→정상 복구 시에만** 웹훅(`HEALTH_WEBHOOK_URL`, Slack/Discord 호환 `{"text":...}`)으로 통지(매일 정상 노이즈 방지). 웹훅 미설정이면 로그만
+- 엔드포인트: **`GET /health/external`**(JSON, `?run=1`이면 즉시 1회 실행) — 수동 점검·외부 업타임 모니터용. 실패 있으면 HTTP 503
+- gunicorn 다중 워커에선 **localhost 락 포트(`HEALTH_LOCK_PORT`, 기본 8401) 바인딩으로 1개 워커만 검진**(중복 알림 방지). 환경변수(모두 선택): `HEALTH_CHECK`(기본 1, `0`이면 비활성)·`HEALTH_INTERVAL`(기본 86400, 최소 300)·`HEALTH_FIRST_DELAY`(기본 60)·`HEALTH_WEBHOOK_URL`·`HEALTH_LOCK_PORT`
+- 한계: 키 만료로 외부 API가 예외 대신 '빈 결과'를 반환하는 경우는 정상으로 보일 수 있음(주로 엔드포인트 이전/404/DNS/TLS 등 치명적 깨짐 탐지에 초점)
+
 ## 카카오톡 챗봇 (카카오 i 오픈빌더 스킬 서버)
 
 - 백엔드 엔드포인트: `POST /kakao` — 카카오 i 오픈빌더 **스킬 서버(웹훅)**. 사고 자유텍스트 → 1차 속보 자동 작성
