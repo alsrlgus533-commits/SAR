@@ -685,6 +685,212 @@ def predep():
     return jsonify(d)
 
 
+# ── 회사 실시간 여객수(수동 입력) ─────────────────────────────────────
+# MTIS 출항전 점검표는 '출항 1회 스냅샷'이라 중간 기항지 승하선/차량 승하차가
+# 반영되지 않거나 일부 선박은 값이 비어 있다. 회사 담당자가 외부망 PC의
+# /pax/send 페이지에서 현재 여객수를 보내면 여기 저장하고, 보고서에서
+# (신선하면) MTIS보다 우선 사용한다. 폴링 데몬 없음 — 사람 손 갱신뿐이라
+# 회사 PC에 상주 부하가 없고, 받는 쪽도 사람 손 속도라 가볍다.
+PAX_TOKEN = os.environ.get("PAX_TOKEN", "")                                   # 전송 인증 토큰(선택, 권장)
+PAX_STORE = os.environ.get("PAX_STORE", os.path.join(BASE_DIR, "pax_store.json"))  # 영속화 파일
+PAX_TTL = int(os.environ.get("PAX_TTL", 64800))                              # '신선' 기준(초). 기본 18시간
+
+_PAX = {}                       # canonical_key -> entry
+_PAX_LOCK = threading.Lock()
+_PAX_FIELDS = ("여객", "대인", "소인", "유아", "승무원", "차량")
+
+
+def _pax_norm(name: str) -> str:
+    """선박명 정규화(공백·끝'호' 제거, 대문자) — 한글/영문 키 매칭용."""
+    s = re.sub(r"\s+", "", str(name or "")).upper()
+    return re.sub(r"호$", "", s)
+
+
+def _pax_load():
+    try:
+        with open(PAX_STORE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            _PAX.update(data)
+    except (OSError, ValueError):
+        pass
+
+
+def _pax_save():
+    try:
+        tmp = PAX_STORE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_PAX, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, PAX_STORE)                  # 원자적 교체(쓰다 깨져도 기존 파일 보존)
+    except OSError:
+        pass
+
+
+def _pax_key(cd: str, name: str) -> str:
+    cd = (cd or "").strip()
+    return cd if cd else "@" + _pax_norm(name)
+
+
+def _pax_set(cd, name, fields, memo=""):
+    """현재 여객수 저장(타임스탬프 갱신). 제공된 항목만 정수로 보관."""
+    entry = {"선박코드": (cd or "").strip(), "선박명": (name or "").strip(),
+             "메모": (memo or "").strip(), "ts": time.time()}
+    for k in _PAX_FIELDS:
+        v = fields.get(k)
+        if v is not None and str(v).strip() != "":
+            try:
+                entry[k] = int(float(v))
+            except (TypeError, ValueError):
+                pass
+    with _PAX_LOCK:
+        _PAX[_pax_key(cd, name)] = entry
+        _pax_save()
+    return entry
+
+
+def _pax_lookup(cd: str = "", name: str = ""):
+    """회사 실시간 여객수 — 신선(PAX_TTL 이내)한 최신 항목만 반환, 없으면 None.
+    선박코드 정확일치 또는 정규화 선박명 일치로 찾는다."""
+    cd = (cd or "").strip()
+    nn = _pax_norm(name)
+    now = time.time()
+    best = None
+    with _PAX_LOCK:
+        for e in _PAX.values():
+            if now - e.get("ts", 0) > PAX_TTL:
+                continue
+            if (cd and e.get("선박코드") == cd) or (nn and _pax_norm(e.get("선박명")) == nn):
+                if best is None or e["ts"] > best["ts"]:
+                    best = e
+    return dict(best) if best else None
+
+
+def _pax_auth_ok() -> bool:
+    if not PAX_TOKEN:
+        return True
+    body = request.get_json(silent=True) or request.form
+    provided = request.headers.get("X-Pax-Token") or str((body or {}).get("token") or "")
+    return secrets.compare_digest(provided, PAX_TOKEN)
+
+
+@app.post("/pax")
+def pax_submit():
+    """회사 담당자가 현재 여객수를 전송(수동 입력). JSON 또는 폼 모두 허용."""
+    if not _pax_auth_ok():
+        return jsonify({"error": "인증 실패(token)"}), 401
+    body = request.get_json(silent=True) or request.form.to_dict() or {}
+    cd = str(body.get("psnshpCd") or body.get("선박코드") or "").strip()
+    name = str(body.get("name") or body.get("선박명") or "").strip()
+    if not cd and not name:
+        return jsonify({"error": "선박명 또는 선박코드가 필요합니다"}), 400
+    fields = {
+        "여객": body.get("여객", body.get("pax")),
+        "대인": body.get("대인", body.get("adult")),
+        "소인": body.get("소인", body.get("child")),
+        "유아": body.get("유아", body.get("infant")),
+        "승무원": body.get("승무원", body.get("crew")),
+        "차량": body.get("차량", body.get("vehicle")),
+    }
+    if all(v is None or str(v).strip() == "" for v in fields.values()):
+        return jsonify({"error": "여객수 등 값이 최소 하나는 필요합니다"}), 400
+    entry = _pax_set(cd, name, fields, str(body.get("메모") or body.get("memo") or ""))
+    return jsonify({"ok": True, "saved": entry})
+
+
+@app.get("/pax")
+def pax_list():
+    """저장된 현재 여객수 목록(신선도 포함). 토큰 설정 시 인증 필요."""
+    if not _pax_auth_ok():
+        return jsonify({"error": "인증 실패(token)"}), 401
+    now = time.time()
+    out = []
+    with _PAX_LOCK:
+        for e in _PAX.values():
+            age = int(now - e.get("ts", 0))
+            out.append({**{k: v for k, v in e.items() if k != "ts"},
+                        "갱신경과초": age, "신선": age <= PAX_TTL})
+    out.sort(key=lambda x: x["갱신경과초"])
+    return jsonify({"ttl초": PAX_TTL, "items": out})
+
+
+@app.get("/pax/send")
+def pax_send_page():
+    """회사용 여객수 전송 페이지(단일 HTML). 토큰은 브라우저에 저장."""
+    return Response(_PAX_SEND_HTML, mimetype="text/html; charset=utf-8")
+
+
+_PAX_SEND_HTML = """<!doctype html><html lang="ko"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>현재 여객수 전송</title>
+<style>
+ body{font-family:system-ui,'Malgun Gothic',sans-serif;max-width:520px;margin:24px auto;padding:0 16px;color:#1f2937}
+ h1{font-size:20px} label{display:block;margin:10px 0 4px;font-size:14px;font-weight:600}
+ input{width:100%;box-sizing:border-box;padding:9px;border:1px solid #cbd5e1;border-radius:8px;font-size:15px}
+ .row{display:flex;gap:8px}.row>div{flex:1}
+ button{margin-top:16px;width:100%;padding:12px;border:0;border-radius:8px;background:#2563eb;color:#fff;font-size:16px;font-weight:700;cursor:pointer}
+ button:active{background:#1d4ed8}
+ .hint{color:#6b7280;font-size:12px;margin-top:4px}
+ #msg{margin-top:14px;padding:10px;border-radius:8px;display:none;font-size:14px}
+ .ok{background:#ecfdf5;color:#065f46}.err{background:#fef2f2;color:#991b1b}
+ table{width:100%;border-collapse:collapse;margin-top:22px;font-size:13px}
+ th,td{border-bottom:1px solid #e5e7eb;padding:6px 4px;text-align:left}
+ .stale{color:#9ca3af} h2{font-size:15px;margin-top:26px}
+</style></head><body>
+<h1>현재 여객수 전송</h1>
+<p class="hint">중간 기항지에서 승하선/승하차로 인원이 바뀌면 이 화면에서 갱신해 주세요. 사고 시 보고서에 자동 반영됩니다.</p>
+<label>선박명 *</label><input id="name" placeholder="예) 섬사랑12호" autocomplete="off">
+<label>선박코드 <span class="hint">(알면 입력 — 더 정확)</span></label><input id="cd" placeholder="KOMSA 선박코드(선택)" autocomplete="off">
+<div class="row">
+ <div><label>여객(계)</label><input id="pax" type="number" inputmode="numeric" min="0"></div>
+ <div><label>승무원</label><input id="crew" type="number" inputmode="numeric" min="0"></div>
+ <div><label>차량</label><input id="veh" type="number" inputmode="numeric" min="0"></div>
+</div>
+<div class="row">
+ <div><label>대인</label><input id="adult" type="number" inputmode="numeric" min="0"></div>
+ <div><label>소인</label><input id="child" type="number" inputmode="numeric" min="0"></div>
+ <div><label>유아</label><input id="infant" type="number" inputmode="numeric" min="0"></div>
+</div>
+<label>메모 <span class="hint">(예: ○○항 출항 후)</span></label><input id="memo" placeholder="선택">
+<label>전송 토큰 <span class="hint">(관리자에게 받은 값 — 1회 입력 후 저장됨)</span></label><input id="token" type="password" autocomplete="off">
+<button id="send">전송</button>
+<div id="msg"></div>
+<h2>현재 저장된 값</h2>
+<table id="cur"><thead><tr><th>선박</th><th>여객</th><th>승무원</th><th>차량</th><th>경과</th></tr></thead><tbody></tbody></table>
+<script>
+const $=id=>document.getElementById(id);
+$("token").value=localStorage.getItem("paxToken")||"";
+function show(t,ok){const m=$("msg");m.textContent=t;m.className=ok?"ok":"err";m.style.display="block";}
+function val(id){const v=$(id).value.trim();return v===""?undefined:Number(v);}
+async function refresh(){
+ try{const r=await fetch("/pax",{headers:{"X-Pax-Token":$("token").value}});
+  if(!r.ok)return;const d=await r.json();
+  const tb=$("cur").querySelector("tbody");tb.innerHTML="";
+  (d.items||[]).forEach(it=>{const tr=document.createElement("tr");if(!it.신선)tr.className="stale";
+   const ag=it.갱신경과초<3600?Math.round(it.갱신경과초/60)+"분 전":Math.round(it.갱신경과초/3600)+"시간 전";
+   tr.innerHTML=`<td>${it.선박명||it.선박코드||"-"}</td><td>${it.여객??"-"}</td><td>${it.승무원??"-"}</td><td>${it.차량??"-"}</td><td>${ag}</td>`;
+   tb.appendChild(tr);});
+ }catch(e){}
+}
+$("send").onclick=async()=>{
+ const name=$("name").value.trim();
+ if(!name&&!$("cd").value.trim()){show("선박명을 입력하세요",false);return;}
+ const token=$("token").value.trim();localStorage.setItem("paxToken",token);
+ const body={name,선박코드:$("cd").value.trim(),token,
+  여객:val("pax"),승무원:val("crew"),차량:val("veh"),
+  대인:val("adult"),소인:val("child"),유아:val("infant"),메모:$("memo").value.trim()};
+ try{const r=await fetch("/pax",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  const d=await r.json();
+  if(r.ok){show("✅ 전송 완료 — "+(d.saved.선박명||d.saved.선박코드)+" 여객 "+(d.saved.여객??"-")+"명",true);refresh();}
+  else show("❌ "+(d.error||"전송 실패"),false);
+ }catch(e){show("❌ 네트워크 오류: "+e.message,false);}
+};
+refresh();setInterval(refresh,30000);
+</script></body></html>"""
+
+
+_pax_load()
+
+
 # ── /parse ──────────────────────────────────────────
 
 PARSE_PROMPT = (
@@ -1369,6 +1575,7 @@ def _build_report_text(utterance: str) -> str:
     summary = str(parsed.get("사고개요") or "").strip()
 
     vessel = route_info = mtis = None
+    cd = ""
     if ship:
         try:
             vessel = _vessel_lookup(ship)
@@ -1444,8 +1651,30 @@ def _build_report_text(utterance: str) -> str:
         L.append(_vms_line(vpos))
     L.append(weather_line)
 
-    # 승선·화물 — MTIS 출항전 점검표(실제) 우선, 없으면 보고자 입력값
-    if mtis:
+    # 승선·화물 — 회사 실시간(신선) > MTIS 출항전 점검표(실제) > 보고자 입력값
+    pax_ovr = _pax_lookup(cd, ship)
+    if pax_ovr:
+        bd = "·".join(f"{lbl} {pax_ovr[k]}" for lbl, k in
+                      (("성인", "대인"), ("소아", "소인"), ("유아", "유아")) if pax_ovr.get(k) is not None)
+        detail = f"({bd})" if bd else ""
+        pax_v = pax_ovr.get("여객")
+        crew_v = pax_ovr.get("승무원")
+        if crew_v is None and mtis:
+            crew_v = mtis.get("승무원")
+        L.append(f"▶ 승선: 여객 {pax_v if pax_v is not None else (pax or '?')}명{detail}, "
+                 f"선원 {crew_v if crew_v is not None else (crew or '?')}명 (회사 실시간 현황)")
+        veh = pax_ovr.get("차량")
+        if veh is None and mtis:
+            veh = mtis.get("차량")
+        cargo, lmt = (mtis or {}).get("화물적재중량", ""), (mtis or {}).get("화물적재한도", "")
+        cargo_txt = " · ".join(x for x in (
+            f"적재 {cargo} M/T" if cargo else "",
+            f"적재한도 {lmt} M/T" if lmt else "",
+            f"차량 {veh}대" if veh else "",
+        ) if x)
+        if cargo_txt:
+            L.append(f"▶ 화물: {cargo_txt}")
+    elif mtis:
         detail = f"(성인 {mtis['대인']}·소아 {mtis['소인']}·유아 {mtis['유아']})"
         tmp = f", 임시승선자 {mtis['임시승선자']}명" if mtis.get("임시승선자") else ""
         L.append(f"▶ 승선: 여객 {mtis['여객']}명{detail}, 선원 {mtis['승무원']}명{tmp} "
@@ -2043,13 +2272,22 @@ def _build_report_data(utterance: str, extra: dict = None, center: str = "") -> 
     if dep and dep.isdigit():
         dep = f"{dep.zfill(4)[:2]}:{dep.zfill(4)[2:]}"
 
-    # 승선 인원
-    if mtis:
-        crew_n = str(mtis.get("승무원") or crew or "")
-        pax_n = str(mtis.get("여객") or pax or "")
-        veh_n = mtis.get("차량") or 0
+    # 승선 인원 — 회사 실시간(신선) > MTIS 출항전 > 보고자 입력값
+    pax_ovr = _pax_lookup(cd, ship)
+
+    def _pax_pick(field, fallback):
+        if pax_ovr and pax_ovr.get(field) is not None:
+            return str(pax_ovr[field])
+        if mtis and mtis.get(field):
+            return str(mtis[field])
+        return str(fallback or "")
+
+    crew_n = _pax_pick("승무원", crew)
+    pax_n = _pax_pick("여객", pax)
+    if pax_ovr and pax_ovr.get("차량") is not None:
+        veh_n = pax_ovr["차량"]
     else:
-        crew_n, pax_n, veh_n = crew, pax, 0
+        veh_n = (mtis or {}).get("차량") or 0
 
     # 서술형 사고개요 (공폼 예시 형식) — Gemini 우선, 실패 시 규칙 조립
     mani = []

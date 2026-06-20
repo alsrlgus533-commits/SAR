@@ -7,10 +7,11 @@
 | 파일 | 역할 |
 |------|------|
 | `해양사고-신속보고-프로토타입.jsx` | React 프론트엔드. 챗봇 UI, 백엔드 호출, 보고서 출력 |
-| `backend.py` | Flask 백엔드. API 키 보관, `/vessel` · `/route` · `/weather` · `/predep` · `/parse` · `/kakao` · `/report/hwpx` 엔드포인트 |
+| `backend.py` | Flask 백엔드. API 키 보관, `/vessel` · `/route` · `/weather` · `/predep` · `/pax` · `/parse` · `/kakao` · `/report/hwpx` 엔드포인트 |
 | `requirements.txt` | Python 의존성 (flask, flask-cors, python-dotenv, pyhwpxlib) |
 | `선박마스터.csv` | (회사 보유·비공개) 선박별 보험·선박번호·선적항·검사기관·국적·사진파일명. `선박마스터.csv.example` 참고 |
 | `vessel_photos/` | (회사 보유·비공개) 선박 사진 이미지. `선박마스터.csv`의 `사진파일명`이 가리킴 |
+| `pax_agent.py` | 회사 내부망 PC용 중계 에이전트. 내부 시스템(웹 화면) 로그인→선박별 현재 승선인원 조회→백엔드 `POST /pax` 전송. 설정은 `pax_agent.env`(비공개, `pax_agent.env.example` 참고) |
 | `proxy.py` | 구 CORS 프록시 — `backend.py`로 대체됨 |
 
 ## 외부 API (모두 backend.py 서버에서 호출 — 브라우저에 키 미노출)
@@ -57,6 +58,16 @@
   - 환경변수: `MTIS_BASE`(선택, 기본 `https://mtis.komsa.or.kr`)
   - 주의: KOMSA 화면용 내부 주소라 사이트 개편 시 깨질 수 있음 — 운영 전환 시 정식 연계 권장
 
+### 회사 실시간 여객수 (중간 기항지 승하선 반영)
+- MTIS 출항전 점검표는 **출항 1회 스냅샷**이라, 중간 기항지에서 여객 승하선·차량 승하차가 발생하는 선박은 실제 승선인원과 어긋나거나 일부 선박은 값이 아예 비어 있다. 실제 현재 승선인원은 **전국 각 센터가 회사 '내부 전용 시스템'(웹 화면, ID/PW 로그인)에 입력**하는데, 이 자료는 **내부망에서만** 보이고 외부망(클라우드 백엔드)에서 직접 못 본다
+- **중계 에이전트 `pax_agent.py`(주 경로)**: 내부망+외부망이 모두 연결된 **회사 PC에서 실행**. ① 내부 시스템 로그인(`requests` 세션) → 선박 목록 표 → 센터별 상세에서 승선인원 파싱 → ② 결과를 외부망으로 백엔드 `POST /pax` 전송(주기 기본 3분). **내부 ID/PW는 회사 PC의 `pax_agent.env`에만**(클라우드 미전송), 백엔드로는 결과 숫자+`PAX_TOKEN`만. 화면별로 다른 파싱 2곳(`parse_vessel_list`/`parse_pax_detail`)은 실제 HTML에 맞춰 확정. 설정 예시 `pax_agent.env.example`, 회사 PC 의존성 `pip install requests python-dotenv`
+- **수동 전송 페이지 `GET /pax/send`(폴백)**: 에이전트가 못 읽는 선박을 담당자가 직접 보정 입력하는 단일 HTML(선박명·선박코드·여객/대인/소인/유아·승무원·차량·메모 → [전송]). 토큰은 브라우저 `localStorage` 저장, 30초마다 현재 저장값 표시
+- **수신/조회**: `POST /pax`(JSON 또는 폼; 키 `name`/`선박코드`·`여객`·`대인`·`소인`·`유아`·`승무원`·`차량`·`메모`·`token`) · `GET /pax`(저장 목록+신선도). `PAX_TOKEN` 설정 시 `X-Pax-Token` 헤더 또는 body `token` 필요(`secrets.compare_digest`)
+- **저장**: 메모리 `_PAX` + JSON 파일 영속화(`PAX_STORE`, 기본 `pax_store.json`, 원자적 교체). 선박코드 정확일치 또는 정규화 선박명(공백·끝'호' 제거·대문자) 일치로 조회(`_pax_lookup`)
+- **신선도**: `PAX_TTL`(초, 기본 18시간) 이내 값만 우선 적용, 지나면 자동으로 MTIS 폴백 — 지난 항차의 낡은 값 오적용 방지
+- **보고서 반영**: `_build_report_text`(1차 속보, '회사 실시간 현황' 표기)·`_build_report_data`(hwpx) 두 곳 모두 **회사 실시간(신선) > MTIS 출항전 > 보고자 입력/LLM** 순으로 여객·승무원·차량을 병합
+- 환경변수(모두 선택): `PAX_TOKEN`·`PAX_TTL`·`PAX_STORE`. `pax_store.json`은 회사 실데이터라 `.gitignore` 등록
+
 ### GICOMS VMS 실시간 선박위치 (allShipTarget)
 - 해양안전종합정보시스템(GICOMS)의 VMS 화면이 쓰는 내부 API `WEB_VMS/WebVMS/allShipTarget.json` 이 **전국 실시간 AIS(~7천척)** 를 한 번에 반환 — 각 선박에 `mmsi·shipName·latitude·longitude·sog·cog·heading·rcvDatetimeFormat·shipType` 등. (구버전 PUBDATA `pubdatareq`는 6개월 이상 과거 전용이라 부적합)
 - 백엔드 엔드포인트: `GET /vessel_position?name=<선박명>` 또는 `?mmsi=<MMSI>`
@@ -93,7 +104,7 @@
 
 - 백엔드 엔드포인트: `POST /report/hwpx` — body `{ utterance, center, extra:{경위,피해,조치} }`. 응답은 hwpx 바이트(`Content-Disposition: attachment`). 프론트 ③단계 **`📄 정식 보고서(hwpx) 다운로드`** 버튼이 호출
 - **hwpx 생성 = `pyhwpxlib`(HwpxBuilder)로 직접 작성** — 한글 오피스/템플릿 파일 불필요. `_compose_report_hwpx()`가 결재 박스(상단 우측)·제목·□사고개요·□선박제원(표, 1열 '선박사진' 칸·라벨 음영·보험현황 병합)·□피해사항·□조치사항·□조치계획·□사진(현장사진, 없으면 운항관리자가 삭제)·날짜를 공폼 순서대로 조립. 저장 후 `_postprocess_report_hwpx()`가 결재 박스 우측정렬 + 선박사진을 선박제원 표 셀로 이동(XML 후처리, pyhwpxlib 미지원 보정). 산출은 유효 hwpx(zip, `mimetype=application/hwp+zip`)
-- **데이터 우선순위: 회사 선박마스터 > KOMSA/MTIS > LLM 추정 > 공폼 자리표시자(`00`/`확인 중`/`없음`)** — `_build_report_data()`가 `_parse_nl`·`_vessel_lookup`·`_route_lookup`·`_predep_lookup`·`_weather_lookup`(기존 재사용) + `_vessel_master` + `_infer_report_fields`를 병합. **외부 조회는 `ThreadPoolExecutor`로 병렬 실행**(파싱 후 vessel/route/infer/VMS 동시 → predep·master는 선박코드 의존, weather는 최종 좌표 의존)해 응답시간을 순차 합산→최댓값으로 단축. 신고문에 좌표가 있으면 VMS(Chromium) 호출은 생략
+- **데이터 우선순위: 회사 선박마스터 > 회사 실시간 여객수(신선·`/pax`) > KOMSA/MTIS > LLM 추정 > 공폼 자리표시자(`00`/`확인 중`/`없음`)** (여객·승무원·차량은 신선한 `/pax` 값이 MTIS보다 우선) — `_build_report_data()`가 `_parse_nl`·`_vessel_lookup`·`_route_lookup`·`_predep_lookup`·`_weather_lookup`(기존 재사용) + `_vessel_master` + `_infer_report_fields`를 병합. **외부 조회는 `ThreadPoolExecutor`로 병렬 실행**(파싱 후 vessel/route/infer/VMS 동시 → predep·master는 선박코드 의존, weather는 최종 좌표 의존)해 응답시간을 순차 합산→최댓값으로 단축. 신고문에 좌표가 있으면 VMS(Chromium) 호출은 생략
   - `_vessel_master(name, code)`: `선박마스터.csv`(UTF-8, 헤더 `선박명,선박코드,보험현황,선박번호,선적항,검사기관,국적,사진파일명`)에서 보험·선박번호·선적항·검사기관·국적·사진을 조회(5분 캐시, 없으면 graceful 빈 dict). 키는 선박코드 우선, 다음 선박명(부분일치 폴백)
   - 사진: ① 회사 `vessel_photos/<사진파일명>`(jpg/png) 우선 → ② 없으면 **KOMSA 공개 여객선 사진** 폴백(`_komsa_vessel_photo`). 표 위에 삽입, 둘 다 없으면 생략
     - KOMSA 공개사진: `www.komsa.or.kr` '여객선 정보' 목록(`prog/psnShip/kor/sub03_0204/list.do`)을 `searchKeyword=선명`으로 조회 → 목록 썸네일 `src(/thumbnail/psnShip/300_PS_*)`에서 `300_` 접두어를 떼면 원본 고해상도 이미지. 선명 정규화(공백·끝'호' 제거) 매칭, 임시파일로 받아 삽입, 1시간 캐시. 키 불필요(공개 페이지)

@@ -33,6 +33,11 @@ vessel_photos/
 # 회사 권위 한글명↔MMSI 매핑(VMS 실시간 위치 조회용) + 원본 관리대장
 선박명_MMSI.csv
 선명,mmsi 목록.xlsx
+# 회사 실시간 여객수 저장소 (운영 중 누적되는 실데이터 — 비공개)
+pax_store.json
+pax_store.json.tmp
+# 회사 내부망 중계 에이전트 설정 (내부 시스템 ID/PW 포함 — 절대 커밋 금지)
+pax_agent.env
 # 보험 수집 중간/결과 데이터 (회사 실데이터 — 비공개)
 보험정보-러프데이터.csv
 보험정보-정리.csv
