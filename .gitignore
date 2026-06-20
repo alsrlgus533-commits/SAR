@@ -32,3 +32,9 @@ vessel_photos/
 # 회사 권위 한글명↔MMSI 매핑(VMS 실시간 위치 조회용) + 원본 관리대장
 선박명_MMSI.csv
 선명,mmsi 목록.xlsx
+# 보험 수집 중간/결과 데이터 (회사 실데이터 — 비공개)
+보험정보-러프데이터.csv
+보험정보-정리.csv
+보험정보-여객10억초과.csv
+검사기관.csv
+vlist.js.txt
