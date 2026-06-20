@@ -388,6 +388,11 @@ function extractLatLon(posText) {
   if (d) return { lat: +d[1], lon: +d[2] };
   return null;
 }
+// 십진 위·경도 → 도-분 표기 "33-31.5N, 126-32.6E" (실시간 위치 표시용)
+function fmtDM(lat, lon) {
+  const one = (v, pos, neg) => { const h = v >= 0 ? pos : neg; v = Math.abs(v); const dg = Math.floor(v); return `${dg}-${((v - dg) * 60).toFixed(1)}${h}`; };
+  return `${one(lat, "N", "S")}, ${one(lon, "E", "W")}`;
+}
 const DIR8 = ["북방", "북동방", "동방", "남동방", "남방", "남서방", "서방", "북서방"];
 // 하버사인 거리(해리) + 초기 방위각
 function relPosition(lat, lon, refText) {
@@ -538,6 +543,14 @@ async function fetchRoute(name, cfg) {
   return backendJson(r, "운항항로");
 }
 
+// ── GICOMS VMS 실시간 위치 조회 (backend.py /vessel_position 경유) ──
+// 신고문에 좌표가 없을 때 선명만으로 현재위치(AIS)를 가져온다. 미설정/미수신 시 backendJson이 예외 → 호출부에서 graceful 처리.
+async function fetchVesselPosition(name, cfg) {
+  const base = (cfg.proxy || "http://localhost:8000").replace(/\/$/, "");
+  const r = await fetch(`${base}/vessel_position?name=${encodeURIComponent(name)}`);
+  return backendJson(r, "실시간위치");
+}
+
 // ── 기상청 API허브 해상관측(sea_obs) 조회 ──
 const DIRS = ["북", "북북동", "북동", "동북동", "동", "동남동", "남동", "남남동", "남", "남남서", "남서", "서남서", "서", "서북서", "북서", "북북서"];
 function tmString(offsetHours = 0) {
@@ -557,13 +570,13 @@ function geocodeFromRefs(locText, refText) {
   }
   return null;
 }
-async function fetchWeather(locText, cfg) {
+async function fetchWeather(locText, cfg, llOverride) {
   // 기상청 직접 호출은 브라우저 CORS·HTML오류 페이지 문제가 있어 backend.py /weather 경유로 조회한다.
   // (백엔드가 .env의 KMA_KEY로 서버측에서 호출 → CSV 정상 수신·파싱)
   const base = (cfg.proxy || "http://localhost:8000").replace(/\/$/, "");
   // 사고 좌표를 함께 보내 백엔드가 '가장 가까운 부이'를 고르게 한다 (지명 매칭 실패 시 엉뚱한 부이 방지)
-  // 좌표가 없으면 기준점 목록으로 좌표를 추정해 앵커로 사용한다.
-  const ll = extractLatLon(locText) || geocodeFromRefs(locText, cfg.refPoints);
+  // 우선순위: VMS 실시간 좌표(llOverride) → 신고문 좌표 → 기준점 목록 추정.
+  const ll = (llOverride && llOverride.lat != null ? llOverride : null) || extractLatLon(locText) || geocodeFromRefs(locText, cfg.refPoints);
   const geo = ll && ll.lat != null && ll.lon != null ? `&lat=${ll.lat}&lon=${ll.lon}` : "";
   const r = await fetch(`${base}/weather?loc=${encodeURIComponent(locText)}${geo}`);
   return backendJson(r, "기상");
@@ -665,10 +678,26 @@ export default function App() {
       }
     }
 
+    // ── GICOMS VMS 실시간 위치 (신고문에 좌표가 없으면 선명으로 현재위치 조회) ──
+    let vpos = null;
+    if (!extractLatLon(parsed.사고위치 || "") && parsed.선박명) {
+      try {
+        vpos = await fetchVesselPosition(parsed.선박명, cfg);
+        if (vpos && vpos.위도 != null) {
+          const spd = vpos.속력_kn != null ? `, ${vpos.속력_kn}kn` : "";
+          setMsgs((m) => [...m, { who: "api", text: `GICOMS VMS 실시간 위치 → ${parsed.선박명}(${vpos.선박명 || ""}): ${fmtDM(vpos.위도, vpos.경도)}${spd} (수신 ${vpos.수신시각 || "-"})`, live: true }]);
+        }
+      } catch (e) {
+        vpos = null;
+        setMsgs((m) => [...m, { who: "api", text: `GICOMS VMS 실시간 위치 조회 불가(${e.message}) — 좌표 없이 진행`, live: false }]);
+      }
+    }
+    const vll = vpos && vpos.위도 != null ? { lat: vpos.위도, lon: vpos.경도 } : null;
+
     // ── 기상청 해상관측 ──
     let wx = null, wSrc = "live";
     try {
-      wx = await fetchWeather(parsed.사고위치 || "", cfg);
+      wx = await fetchWeather(parsed.사고위치 || "", cfg, vll);
       const awsTxt = wx.AWS ? ` · 인근 ${wx.AWS.지점}: 풍향 ${wx.AWS.풍향}, 풍속 ${wx.AWS.풍속}, 기온 ${wx.AWS.기온}` : "";
       setMsgs((m) => [...m, { who: "api", text: `기상청 해상관측 API → ${wx.지점}: 풍향 ${wx.풍향}, 풍속 ${wx.풍속}, 파고 ${wx.파고}${wx.파고출처 ? `(${wx.파고출처})` : ""}, 수온 ${wx.수온} (관측 ${wx.관측시각})${awsTxt}`, live: true }]);
     } catch (e) {
@@ -691,12 +720,16 @@ export default function App() {
     }
 
     setSrc({ vessel: vSrc, wx: wSrc, route: rSrc });
-    // ── 기준점 상대위치 자동 계산 ──
+    // ── 기준점 상대위치 자동 계산 (신고문 좌표 우선, 없으면 VMS 실시간 좌표) ──
     let 상대위치 = "";
-    const ll = extractLatLon(parsed.사고위치 || "");
+    const ll = extractLatLon(parsed.사고위치 || "") || vll;
     if (ll && ll.lat != null && ll.lon != null) {
       상대위치 = relPosition(ll.lat, ll.lon, cfg.refPoints) || "";
       if (상대위치) setMsgs((m) => [...m, { who: "api", text: `기준점 상대위치 자동 계산 → ${상대위치}`, live: true }]);
+    }
+    // 신고문에 위치가 없고 AIS로 현위치를 얻었으면 사고위치 칸에 좌표를 표기
+    if (!(parsed.사고위치 || "").trim() && vll) {
+      parsed.사고위치 = `${fmtDM(vll.lat, vll.lon)} (실시간 AIS · 수신 ${vpos.수신시각 || "-"})`;
     }
     const total = (parseInt(parsed.여객 || 0) + parseInt(parsed.승무원 || 0)) || "";
     setReport({ ...parsed, 원문: text, 상대위치, 합계: total, vessel, wx, route, 발생일시: `${new Date().toLocaleDateString("ko-KR")} ${now()}` });
