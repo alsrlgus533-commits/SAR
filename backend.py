@@ -2177,8 +2177,9 @@ def _compose_report_hwpx(data: dict) -> bytes:
     # 결재 박스(공폼 상단 우측) — 후처리(_postprocess_report_hwpx)에서 우측 정렬
     try:
         b.add_table([["", "", "결재"]], width=11000, col_widths=[4500, 4500, 2000],
-                    row_heights=[2200],
-                    cell_aligns={(0, 0): "CENTER", (0, 1): "CENTER", (0, 2): "CENTER"})
+                    row_heights=[2200], header_bg="",          # 칸 안 흰색(프리셋 파랑 제거), 테두리만
+                    cell_aligns={(0, 0): "CENTER", (0, 1): "CENTER", (0, 2): "CENTER"},
+                    cell_styles={(0, 2): {"text_color": "#000000", "bold": True}})  # '결재' 글자 검정
     except Exception:
         pass
     # 제목: 공폼 형식 "(○○호 사고종류) 사고 보고" — 선박명 + 사고종류
@@ -2225,16 +2226,22 @@ def _compose_report_hwpx(data: dict) -> bytes:
     merge_info = [(0, 0, 3, 0)]   # 1열(선박사진) 4행 세로 병합
     label_bg = {(0, c): "#EFEFEF" for c in range(1, 6)}
     label_bg.update({(1, c): "#EFEFEF" for c in range(1, 6)})
-    # 라벨 글자 검정(프리셋이 머리행 글자를 흰색으로 넣어 안 보이던 문제 해결)
+    # 선박사진칸(0,0)·데이터칸(2·3행)은 흰색으로 명시 — 프리셋 머리행 파랑/줄무늬 회색 덮어쓰기
+    label_bg[(0, 0)] = "#FFFFFF"
+    for r in (2, 3):
+        for c in range(6):
+            label_bg[(r, c)] = "#FFFFFF"
+    # 라벨·선박사진 글자 검정(프리셋이 머리행 글자를 흰색으로 넣어 흰배경서 안 보이던 문제 해결)
     cell_styles = {(0, c): {"text_color": "#000000", "bold": True} for c in range(1, 6)}
     cell_styles.update({(1, c): {"text_color": "#000000", "bold": True} for c in range(1, 6)})
+    cell_styles[(0, 0)] = {"text_color": "#000000", "bold": True}
     cell_aligns = {(r, c): "CENTER" for r in range(4) for c in range(6)}
     col_widths = [11000, 6300, 6300, 6300, 6300, 6320]   # 합 42520 = A4 본문폭
     # 4행 합 = 사진 높이 + 셀 상하 여백 → 사진이 칸을 세로로 꽉 채움
     rh = max(850, round((photo_h + vpad) / 4)) if photo_h else 1500
     row_heights = [rh, rh, rh, rh]
     try:
-        b.add_table(rows, cell_colors=label_bg, merge_info=merge_info,
+        b.add_table(rows, cell_colors=label_bg, merge_info=merge_info, header_bg="",
                     cell_aligns=cell_aligns, cell_styles=cell_styles,
                     col_widths=col_widths, row_heights=row_heights)
     except Exception:
