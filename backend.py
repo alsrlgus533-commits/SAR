@@ -2800,12 +2800,25 @@ def _health_checks() -> dict:
         "기상청_해상관측": kma_weather, "MTIS_출항전점검": mtis_predep,
         "GICOMS_VMS로그인": gicoms_vms,
     }
+    def _run_check(fn):
+        last = (False, "미실행")
+        for _ in range(2):                         # 일시적 TLS/타임아웃 false-positive 방지(1회 재시도)
+            try:
+                ok, detail = fn()
+            except Exception as exc:
+                ok, detail = False, str(exc)
+            if ok is not False:                    # 정상(True)·건너뜀(None)은 즉시 채택
+                return ok, detail
+            last = (ok, detail)
+            time.sleep(0.8)
+        return last
+
     checks = {}
     with ThreadPoolExecutor(max_workers=len(funcs)) as ex:
-        futs = {name: ex.submit(fn) for name, fn in funcs.items()}
+        futs = {name: ex.submit(_run_check, fn) for name, fn in funcs.items()}
         for name, fut in futs.items():
             try:
-                ok, detail = fut.result(timeout=60)
+                ok, detail = fut.result(timeout=90)
             except Exception as exc:
                 ok, detail = False, str(exc)
             checks[name] = {"ok": ok, "detail": detail}
