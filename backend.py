@@ -2089,8 +2089,8 @@ def _postprocess_report_hwpx(hwpx_path: str) -> None:
     ① 결재 박스 표를 상단 우측 정렬(공폼처럼) — 우측정렬 문단(기준 일시)의 paraPrIDRef 재사용
     ② 선박사진(floating 그림)을 선박제원 표 좌측 첫 셀('선박사진' 칸) 안으로 이동(표 셀 이미지 미지원)."""
     import zipfile
-    from lxml import etree
     try:
+        from lxml import etree   # 미설치 시 후처리만 생략(보고서 본문은 정상 생성)
         with zipfile.ZipFile(hwpx_path, "r") as zin:
             names = zin.namelist()
             sec = "Contents/section0.xml"
