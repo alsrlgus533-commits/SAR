@@ -22,6 +22,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 from dotenv import load_dotenv
@@ -1922,33 +1923,41 @@ def _build_report_data(utterance: str, extra: dict = None, center: str = "") -> 
     crew = str(parsed.get("승무원") or "").strip()
     summary = str(parsed.get("사고개요") or "").strip()
 
-    vessel = route_info = mtis = None
-    if ship:
-        try:
-            vessel = _vessel_lookup(ship)
-        except Exception:
-            vessel = None
-        try:
-            route_info = _route_lookup(ship)
-        except Exception:
-            route_info = None
-        cd = (vessel or {}).get("선박코드", "")
-        if cd:
-            try:
-                mtis = _predep_lookup(cd)
-            except Exception:
-                mtis = None
-
-    vpos = _vms_position_safe(ship)
     lat, lon = _extract_latlon(loc)
-    if lat is None and vpos and vpos.get("위도") is not None:   # 신고 좌표 없으면 AIS 현위치 사용
-        lat, lon = vpos["위도"], vpos["경도"]
-    wx = _weather_lookup(loc, "" if lat is None else str(lat), "" if lon is None else str(lon))
-    if wx.get("error"):
-        wx = None
 
-    master = _vessel_master(ship, (vessel or {}).get("선박코드", ""))
-    inf = _infer_report_fields(utterance, ship, summary, extra)
+    # 외부 조회를 병렬 실행해 1차 보고서 응답시간을 단축(순차 합산 → 최댓값).
+    # 의존관계: predep·master ← vessel(선박코드), weather ← 최종 좌표(신고 or VMS), 나머지는 독립.
+    def _try(fn, *a):
+        try:
+            return fn(*a)
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        f_vessel = ex.submit(_try, _vessel_lookup, ship) if ship else None
+        f_route = ex.submit(_try, _route_lookup, ship) if ship else None
+        f_infer = ex.submit(_infer_report_fields, utterance, ship, summary, extra)
+        # 신고문에 좌표가 없을 때만 VMS(AIS) 현위치 조회 — 좌표 있으면 Chromium 로그인 비용 생략
+        f_vpos = ex.submit(_vms_position_safe, ship) if (lat is None and ship) else None
+
+        vessel = f_vessel.result() if f_vessel else None
+        cd = (vessel or {}).get("선박코드", "")
+        f_predep = ex.submit(_try, _predep_lookup, cd) if cd else None
+        f_master = ex.submit(_vessel_master, ship, cd)
+
+        route_info = f_route.result() if f_route else None
+        mtis = f_predep.result() if f_predep else None
+        master = f_master.result() or {}
+        vpos = f_vpos.result() if f_vpos else None
+        if lat is None and vpos and vpos.get("위도") is not None:   # 신고 좌표 없으면 AIS 현위치 사용
+            lat, lon = vpos["위도"], vpos["경도"]
+
+        f_wx = ex.submit(_weather_lookup, loc, "" if lat is None else str(lat),
+                         "" if lon is None else str(lon))   # 최종 좌표 확정 후 제출(VMS 결과 반영)
+        wx = f_wx.result()
+        inf = f_infer.result()
+    if wx and wx.get("error"):
+        wx = None
 
     kst = timezone(timedelta(hours=9))
     now = datetime.now(kst)
@@ -2591,6 +2600,30 @@ def vessel_position():
 
 
 # ── 진입점 ──────────────────────────────────────────
+
+def _vms_warm_loop():
+    """백그라운드: JSESSIONID 로그인 쿠키를 만료 전에 갱신해, 보고서 경로에서 콜드 Chromium
+    로그인(수초~십수초) 대기를 없앤다. 좌표 없이 '선명만' 입력해도 VMS 현위치 조회가 즉시 동작.
+    ※ 로그인 쿠키만 갱신할 뿐 allShipTarget(AIS 선박위치)은 호출하지 않음 → '사고 시에만 조회' 원칙 유지."""
+    interval = max(60, _VMS_COOKIE_TTL - 120)   # 쿠키 만료 2분 전 선제 갱신
+    while True:
+        try:
+            _vms_cookie()
+        except Exception as exc:
+            print(f"[vms] 쿠키 워밍 실패(다음 주기 재시도): {exc}", flush=True)
+        time.sleep(interval)
+
+
+def _start_vms_warmer():
+    """gunicorn(워커별 import)에서도 동작하도록 모듈 로드 시 호출. 키 없거나 VMS_WARM=0이면 비활성."""
+    if not (GICOMS_VMS_ID and GICOMS_VMS_PW) or os.environ.get("VMS_WARM", "1") == "0":
+        return
+    threading.Thread(target=_vms_warm_loop, name="vms-warmer", daemon=True).start()
+    print("[vms] 세션 워머 시작(쿠키 선제 갱신)", flush=True)
+
+
+_start_vms_warmer()
+
 
 if __name__ == "__main__":
     missing = [k for k in ("KOMSA_KEY", "KMA_KEY") if not os.environ.get(k)]

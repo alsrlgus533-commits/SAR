@@ -64,9 +64,10 @@
   - 로그인 구현: 홈에서 `loginForm.id/password` 값을 JS로 세팅 후 `actionLogin('ID')` 호출(가시성 우회). **반드시 `http://www.gicoms.go.kr`** (https는 404)
 - **매칭(`_vms_position`)**: ① **권위목록(`선박명_MMSI.csv`)으로 한글명→MMSI 해석**(`_mmsi_map`) → ② MMSI 정확일치 → ③ 목록에 없으면 선박명 정규화('호'·공백 제거, 대문자) 정확일치 → ④ '여객' 선종에 한해서만 부분일치(화물선 오매칭 차단). AIS 원시단위 보정: `cog`/`sog`는 ×10(>360/>102.2면 ÷10), `heading=511`은 미지정(None)
   - **VMS `shipName`은 여객선도 100% 영문/로마자**(`SEASTAR 1`,`ARION JEJU`)라 한국어 사고신고명과 직접 매칭 불가 → **회사 권위 목록 `선박명_MMSI.csv`(헤더 `선박명,MMSI[,선박번호]`, 비공개·`.gitignore`)** 로 한글명→MMSI를 확정해 **MMSI 정확조회**(이게 100% 정확). env `VESSEL_MMSI`로 경로 지정 가능, 5분 캐시. 목록 출처: 운항관리 관리대장(`선명,mmsi 목록.xlsx`의 '26년 현재' 시트)에서 추출
-- 환경변수: `GICOMS_VMS_ID`·`GICOMS_VMS_PW`(= GICOMS userId와 동일), `GICOMS_BASE`(선택, 기본 `http://www.gicoms.go.kr`)
+- 환경변수: `GICOMS_VMS_ID`·`GICOMS_VMS_PW`(= GICOMS userId와 동일), `GICOMS_BASE`(선택, 기본 `http://www.gicoms.go.kr`), `VMS_WARM`(선택, 기본 ON; `0`이면 세션 워머 비활성)
+- **세션 워머(`_vms_warm_loop`/`_start_vms_warmer`)**: 모듈 로드 시(gunicorn 워커별) 데몬 스레드가 JSESSIONID 쿠키를 만료 2분 전(~23분 주기)에 선제 갱신 → 보고서 경로에서 **콜드 Chromium 로그인(수초~십수초) 대기 제거**. 좌표 없이 '선명만' 입력해도 VMS 현위치 조회가 즉시 동작(보고서 ~14초→~2-3초). **로그인 쿠키만 갱신하고 `allShipTarget`은 호출 안 함** → '사고 시에만 AIS 조회' 원칙 유지
 - 의존성: `playwright` + `python -m playwright install chromium`. 미설치/키 없음 시 `/vessel_position`만 503(다른 기능 영향 없음 — graceful degradation)
-- 주의: 내부 화면용 주소라 사이트 개편 시 깨질 수 있음 — 폴링 금지(사고 시에만 조회), 운영 전환 시 정식 연계 권장
+- 주의: 내부 화면용 주소라 사이트 개편 시 깨질 수 있음 — AIS 선박위치 폴링 금지(사고 시에만 조회; 워머는 쿠키만 갱신), 운영 전환 시 정식 연계 권장
 
 ## 카카오톡 챗봇 (카카오 i 오픈빌더 스킬 서버)
 
@@ -84,7 +85,7 @@
 
 - 백엔드 엔드포인트: `POST /report/hwpx` — body `{ utterance, center, extra:{경위,피해,조치} }`. 응답은 hwpx 바이트(`Content-Disposition: attachment`). 프론트 ③단계 **`📄 정식 보고서(hwpx) 다운로드`** 버튼이 호출
 - **hwpx 생성 = `pyhwpxlib`(HwpxBuilder)로 직접 작성** — 한글 오피스/템플릿 파일 불필요. `_compose_report_hwpx()`가 결재 박스(상단 우측)·제목·□사고개요·□선박제원(표, 1열 '선박사진' 칸·라벨 음영·보험현황 병합)·□피해사항·□조치사항·□조치계획·□사진(현장사진, 없으면 운항관리자가 삭제)·날짜를 공폼 순서대로 조립. 저장 후 `_postprocess_report_hwpx()`가 결재 박스 우측정렬 + 선박사진을 선박제원 표 셀로 이동(XML 후처리, pyhwpxlib 미지원 보정). 산출은 유효 hwpx(zip, `mimetype=application/hwp+zip`)
-- **데이터 우선순위: 회사 선박마스터 > KOMSA/MTIS > LLM 추정 > 공폼 자리표시자(`00`/`확인 중`/`없음`)** — `_build_report_data()`가 `_parse_nl`·`_vessel_lookup`·`_route_lookup`·`_predep_lookup`·`_weather_lookup`(기존 재사용) + `_vessel_master` + `_infer_report_fields`를 병합
+- **데이터 우선순위: 회사 선박마스터 > KOMSA/MTIS > LLM 추정 > 공폼 자리표시자(`00`/`확인 중`/`없음`)** — `_build_report_data()`가 `_parse_nl`·`_vessel_lookup`·`_route_lookup`·`_predep_lookup`·`_weather_lookup`(기존 재사용) + `_vessel_master` + `_infer_report_fields`를 병합. **외부 조회는 `ThreadPoolExecutor`로 병렬 실행**(파싱 후 vessel/route/infer/VMS 동시 → predep·master는 선박코드 의존, weather는 최종 좌표 의존)해 응답시간을 순차 합산→최댓값으로 단축. 신고문에 좌표가 있으면 VMS(Chromium) 호출은 생략
   - `_vessel_master(name, code)`: `선박마스터.csv`(UTF-8, 헤더 `선박명,선박코드,보험현황,선박번호,선적항,검사기관,국적,사진파일명`)에서 보험·선박번호·선적항·검사기관·국적·사진을 조회(5분 캐시, 없으면 graceful 빈 dict). 키는 선박코드 우선, 다음 선박명(부분일치 폴백)
   - 사진: ① 회사 `vessel_photos/<사진파일명>`(jpg/png) 우선 → ② 없으면 **KOMSA 공개 여객선 사진** 폴백(`_komsa_vessel_photo`). 표 위에 삽입, 둘 다 없으면 생략
     - KOMSA 공개사진: `www.komsa.or.kr` '여객선 정보' 목록(`prog/psnShip/kor/sub03_0204/list.do`)을 `searchKeyword=선명`으로 조회 → 목록 썸네일 `src(/thumbnail/psnShip/300_PS_*)`에서 `300_` 접두어를 떼면 원본 고해상도 이미지. 선명 정규화(공백·끝'호' 제거) 매칭, 임시파일로 받아 삽입, 1시간 캐시. 키 불필요(공개 페이지)
