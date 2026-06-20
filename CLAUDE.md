@@ -89,7 +89,7 @@
   - `_vessel_master(name, code)`: `선박마스터.csv`(UTF-8, 헤더 `선박명,선박코드,보험현황,선박번호,선적항,검사기관,국적,사진파일명`)에서 보험·선박번호·선적항·검사기관·국적·사진을 조회(5분 캐시, 없으면 graceful 빈 dict). 키는 선박코드 우선, 다음 선박명(부분일치 폴백)
   - 사진: ① 회사 `vessel_photos/<사진파일명>`(jpg/png) 우선 → ② 없으면 **KOMSA 공개 여객선 사진** 폴백(`_komsa_vessel_photo`). 표 위에 삽입, 둘 다 없으면 생략
     - KOMSA 공개사진: `www.komsa.or.kr` '여객선 정보' 목록(`prog/psnShip/kor/sub03_0204/list.do`)을 `searchKeyword=선명`으로 조회 → 목록 썸네일 `src(/thumbnail/psnShip/300_PS_*)`에서 `300_` 접두어를 떼면 원본 고해상도 이미지. 선명 정규화(공백·끝'호' 제거) 매칭, 임시파일로 받아 삽입, 1시간 캐시. 키 불필요(공개 페이지)
-  - `_infer_report_fields()`: LLM(Gemini→Claude, 기존 `_gemini_generate`/`_claude_generate` 재사용)으로 `사고종류(공폼 18종)·추정원인·인명/오염/선박 피해·지연시간·조치사항·조치계획` 추정. 키·네트워크 실패 시 규칙 폴백(`_accident_type` 등)
+  - `_parse_and_infer()`: **파싱(선박명·사고위치·여객·승무원·사고개요)과 공폼 추정(사고종류 18종·추정원인·인명/오염/선박 피해·지연시간·조치사항·조치계획)을 1회 LLM 호출로 동시 수행**(보고서당 LLM 왕복 2→1, 429 완화). 실패/키없음 시 `_rule_parse`+`_infer_fallback` 규칙 폴백(추가 LLM 호출 없음). 추정 병합은 `_merge_infer`. (별도 `_infer_report_fields()`는 추정만 하는 단독 헬퍼로 유지 — 파싱이 이미 끝난 컨텍스트용)
   - 환경변수(선택): `VESSEL_MASTER`(CSV 경로), `VESSEL_PHOTOS`(사진 폴더 경로)
 - 회사 데이터는 **비공개**: `선박마스터.csv`·`vessel_photos/`는 `.gitignore` 등록. 커밋용 예시는 `선박마스터.csv.example`
 

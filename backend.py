@@ -1789,11 +1789,10 @@ def _accident_type(summary: str, utterance: str) -> str:
     return "기타"
 
 
-def _infer_report_fields(utterance: str, ship: str, summary: str, extra: dict) -> dict:
-    """LLM으로 공폼의 빈 항목 추정: 사고종류·추정원인·인명/오염/선박 피해·지연시간·
-    조치사항(list)·조치계획(list). 실패 시 안전 기본값."""
+def _infer_fallback(utterance: str, summary: str) -> dict:
+    """공폼 추정 항목의 안전 기본값(LLM 미설정/실패 시). _infer_report_fields·_parse_and_infer 공용."""
     now_hm = datetime.now(timezone(timedelta(hours=9))).strftime("%H:%M")
-    fallback = {
+    return {
         "사고종류": _accident_type(summary, utterance),
         "추정원인": "확인 중",
         "인명피해": "없음",
@@ -1803,6 +1802,28 @@ def _infer_report_fields(utterance: str, ship: str, summary: str, extra: dict) -
         "조치사항": [f"{now_hm} 사고 접수", "관계기관 상황전파(지방청·해경서)", _DEFAULT_ACTION],
         "조치계획": ["사고 부위 정밀 점검·수리 예정", "재발방지 대책 마련 및 교육 실시 예정"],
     }
+
+
+def _merge_infer(d: dict, fallback: dict) -> dict:
+    """LLM이 준 추정 dict를 기본값 위에 병합(빈 값은 무시, 조치사항/계획은 list화). 공용 헬퍼."""
+    out = dict(fallback)
+    for k in ("사고종류", "추정원인", "인명피해", "오염피해", "선박피해", "지연시간"):
+        v = str(d.get(k, "") or "").strip()
+        if v:
+            out[k] = v
+    for k in ("조치사항", "조치계획"):
+        v = d.get(k)
+        if isinstance(v, list) and v:
+            out[k] = [str(x).strip() for x in v if str(x).strip()]
+        elif isinstance(v, str) and v.strip():
+            out[k] = [v.strip()]
+    return out
+
+
+def _infer_report_fields(utterance: str, ship: str, summary: str, extra: dict) -> dict:
+    """LLM으로 공폼의 빈 항목 추정: 사고종류·추정원인·인명/오염/선박 피해·지연시간·
+    조치사항(list)·조치계획(list). 실패 시 안전 기본값."""
+    fallback = _infer_fallback(utterance, summary)
     if not (GEMINI_KEY or ANTHROPIC_KEY):
         return fallback
     prompt = (
@@ -1821,21 +1842,53 @@ def _infer_report_fields(utterance: str, ship: str, summary: str, extra: dict) -
     try:
         raw = _llm_text(prompt, 700)
         raw = (raw or "").replace("```json", "").replace("```", "").strip()
-        d = json.loads(raw)
-        out = dict(fallback)
-        for k in ("사고종류", "추정원인", "인명피해", "오염피해", "선박피해", "지연시간"):
-            v = str(d.get(k, "")).strip()
-            if v:
-                out[k] = v
-        for k in ("조치사항", "조치계획"):
-            v = d.get(k)
-            if isinstance(v, list) and v:
-                out[k] = [str(x).strip() for x in v if str(x).strip()]
-            elif isinstance(v, str) and v.strip():
-                out[k] = [v.strip()]
-        return out
+        return _merge_infer(json.loads(raw), fallback)
     except Exception:
         return fallback
+
+
+def _parse_and_infer(utterance: str, extra: dict = None):
+    """1회 LLM 호출로 ① 파싱(선박명·사고위치·여객·승무원·사고개요)과 ② 공폼 추정(사고종류·추정원인·
+    인명/오염/선박 피해·지연시간·조치사항·조치계획)을 동시 수행 → (parsed, inferred) 반환.
+    보고서당 LLM 왕복을 2→1회로 줄여 속도·429를 완화. LLM 미설정/실패 시 규칙 파싱+안전 기본값 폴백."""
+    extra = extra or {}
+    if not (GEMINI_KEY or ANTHROPIC_KEY):
+        parsed = _rule_parse(utterance)
+        return parsed, _infer_fallback(utterance, parsed.get("사고개요", ""))
+
+    prompt = (
+        "너는 여객선 해양사고 보고를 돕는다. 아래 신고 내용에서 ① 핵심 정보를 추출하고 ② 정식 보고서"
+        "('해양사고 공폼') 항목을 추정해 **하나의 JSON으로만** 출력하라(설명·마크다운 금지).\n"
+        f"신고 원문: {utterance}\n"
+        f"운항관리자 보충 — 경위: {extra.get('경위','')} / 피해: {extra.get('피해','')} / 조치: {extra.get('조치','')}\n\n"
+        "출력 형식(JSON):\n{"
+        "\"선박명\":\"'호'까지 포함, 모르면 빈문자열\","
+        "\"사고위치\":\"좌표·지명 포함, 모르면 빈문자열\","
+        "\"여객\":\"숫자만 또는 빈문자열\",\"승무원\":\"숫자만 또는 빈문자열\","
+        "\"사고개요\":\"한 문장\","
+        "\"사고종류\":\"공폼 18종 중 하나(충돌/접촉/좌초/전복/화재/폭발/침몰/행방불명/기관손상/"
+        "추진축계손상/조타장치손상/속구손상/침수/부유물감김/운항저해/해양오염/안전사고/기타)\","
+        "\"추정원인\":\"한 줄\",\"인명피해\":\"없음 또는 내용\",\"오염피해\":\"없음 또는 내용\","
+        "\"선박피해\":\"없음/확인 중 또는 내용\",\"지연시간\":\"확인 중 또는 내용\","
+        "\"조치사항\":[\"시각 포함 한 줄씩\"],\"조치계획\":[\"한 줄씩\"]}\n"
+        "확인되지 않은 항목은 공폼 관례대로 '확인 중' 또는 '없음'으로. 한국어로."
+    )
+    try:
+        raw = _llm_text(prompt, 900)
+        raw = (raw or "").replace("```json", "").replace("```", "").strip()
+        d = json.loads(raw)
+        if not isinstance(d, dict):
+            raise ValueError("JSON dict 아님")
+    except Exception:
+        parsed = _rule_parse(utterance)             # 실패 시 추가 LLM 호출 없이 규칙 폴백
+        return parsed, _infer_fallback(utterance, parsed.get("사고개요", ""))
+
+    parsed = {k: str(d.get(k, "") or "").strip()
+              for k in ("선박명", "사고위치", "여객", "승무원", "사고개요")}
+    if not any(parsed.values()):                     # 파싱이 전부 비면 규칙 파싱으로 보강
+        parsed = _rule_parse(utterance)
+    inferred = _merge_infer(d, _infer_fallback(utterance, parsed.get("사고개요", "")))
+    return parsed, inferred
 
 
 def _kr_date(d: datetime) -> str:
@@ -1916,7 +1969,7 @@ def _build_report_data(utterance: str, extra: dict = None, center: str = "") -> 
     """챗봇 입력 → 공폼 보고서용 데이터 dict 구성.
     우선순위: 회사 선박마스터 > KOMSA/MTIS > LLM 추정 > 공폼 자리표시자."""
     extra = extra or {}
-    parsed = _parse_nl(utterance)
+    parsed, inf = _parse_and_infer(utterance, extra)   # 파싱+공폼추정 1회 LLM 호출(2→1)
     ship = str(parsed.get("선박명") or "").strip()
     loc = str(parsed.get("사고위치") or "").strip()
     pax = str(parsed.get("여객") or "").strip()
@@ -1936,7 +1989,6 @@ def _build_report_data(utterance: str, extra: dict = None, center: str = "") -> 
     with ThreadPoolExecutor(max_workers=6) as ex:
         f_vessel = ex.submit(_try, _vessel_lookup, ship) if ship else None
         f_route = ex.submit(_try, _route_lookup, ship) if ship else None
-        f_infer = ex.submit(_infer_report_fields, utterance, ship, summary, extra)
         # 신고문에 좌표가 없을 때만 VMS(AIS) 현위치 조회 — 좌표 있으면 Chromium 로그인 비용 생략
         f_vpos = ex.submit(_vms_position_safe, ship) if (lat is None and ship) else None
 
@@ -1955,7 +2007,6 @@ def _build_report_data(utterance: str, extra: dict = None, center: str = "") -> 
         f_wx = ex.submit(_weather_lookup, loc, "" if lat is None else str(lat),
                          "" if lon is None else str(lon))   # 최종 좌표 확정 후 제출(VMS 결과 반영)
         wx = f_wx.result()
-        inf = f_infer.result()
     if wx and wx.get("error"):
         wx = None
 
