@@ -128,6 +128,7 @@ VWORLD_KEY=여기에_실제_키      # 선택 — 기점 좌표 지오코딩 유
 
 ### 기점(기준점) 좌표 데이터 (정적)
 - 사고위치 상대표기(`(○○ 북동쪽 N마일)`)에 쓰는 기준점 목록은 **정적 데이터**로 코드에 박혀 있다: 프론트 `해양사고-신속보고-프로토타입.jsx`의 `refPoints`, 백엔드 `backend.py`의 `_REF_POINTS` — **두 곳을 동일 값으로 동기화**한다(도-분 표기 ↔ 도-분 산술식). 서버 런타임은 외부 호출 없이 이 정적 목록만 사용
+  - **동기화 검증**: `check_refpoints_sync.py`가 두 목록을 십진좌표로 파싱해 이름·좌표 일치를 대조(`python check_refpoints_sync.py` 수동 실행, 불일치 시 exit 1). `.claude/settings.json`의 **PostToolUse 훅**이 두 파일 편집 시 자동 실행해 불일치를 즉시 경고(허용오차 0.001°≈한 자리 미만)
 - **출처: KOMSA 연안여객선 기항지 공식 API** `port-call-info` (국가중점데이터) — `portcl_nm`(기항지명)·`lat`/`lot`(위·경도) 공식 좌표를 일괄 수신해 채움. 동해안·외해처럼 여객 기항지가 없는 구간은 주요 등대·항으로 보충(5km 내 중복 제외). 결과 마스터: `기항지_공식좌표.csv`, 목록: `기점목록.txt`
   - API: `https://mtisopenapi.komsa.or.kr/eopt/api/port-call-info?serviceKey=<키>&pageNo=1&numOfRows=2000`
   - **serviceKey 형식**: KOMSA MTIS 포털 발급 `<고정 hex키><JWT 액세스토큰>` 을 **이어붙인 값**. JWT는 **30분 만료**라 런타임 상시호출엔 부적합 → 좌표는 변하지 않으므로 **1회 수신 후 정적 반영**이 적절
