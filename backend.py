@@ -1529,24 +1529,69 @@ _REF_POINTS = [
 _DIR8 = ["북", "북동", "동", "남동", "남", "남서", "서", "북서"]
 
 
-def _rel_position(lat, lon) -> str:
-    """사고 좌표 → 가장 가까운 기준점 기준 '○○ ○쪽 N마일'. 좌표 없으면 ''."""
+def _hav_nm(lat1, lon1, lat2, lon2):
+    """두 점 거리(해리)."""
+    from math import radians, sin, cos, asin, sqrt
+    dlat, dlon = radians(lat2 - lat1), radians(lon2 - lon1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+    return 2 * 3440.065 * asin(sqrt(a))
+
+
+def _bearing(lat1, lon1, lat2, lon2):
+    """lat1,lon1 → lat2,lon2 초기 방위각(도)."""
+    from math import radians, sin, cos, atan2, pi
+    dlon = radians(lon2 - lon1)
+    y = sin(dlon) * cos(radians(lat2))
+    x = cos(radians(lat1)) * sin(radians(lat2)) - sin(radians(lat1)) * cos(radians(lat2)) * cos(dlon)
+    return (atan2(y, x) * 180 / pi + 360) % 360
+
+
+def _port_label(name: str) -> str:
+    """기점(기항지)명을 '○○항' 표기로. 괄호(접안지 세부)는 떼고, 이미 항/등대/방파제면 그대로."""
+    base = re.sub(r"\s*\(.*?\)", "", name).strip() or name
+    if "항" in base or base.endswith("등대") or base.endswith("방파제"):
+        return base
+    return base + "항"
+
+
+def _rel_position_detail(lat, lon):
+    """사고 좌표 → 가장 가까운 여객선 기항지(항구) 기준 상대위치 dict.
+    이름은 '○○항', 거리·방위는 그 항구 지점에서 계산. 좌표 없으면 None."""
     if lat is None or lon is None:
-        return ""
-    from math import radians, sin, cos, asin, sqrt, atan2, pi
+        return None
     best = None
     for name, rlat, rlon in _REF_POINTS:
-        dlat, dlon = radians(lat - rlat), radians(lon - rlon)
-        a = sin(dlat / 2) ** 2 + cos(radians(rlat)) * cos(radians(lat)) * sin(dlon / 2) ** 2
-        dist = 2 * 3440.065 * asin(sqrt(a))
-        y = sin(dlon) * cos(radians(lat))
-        x = cos(radians(rlat)) * sin(radians(lat)) - sin(radians(rlat)) * cos(radians(lat)) * cos(dlon)
-        brg = (atan2(y, x) * 180 / pi + 360) % 360
-        if best is None or dist < best[1]:
-            best = (name, dist, brg)
-    name, dist, brg = best
-    dist_txt = f"{dist:.1f}" if dist < 10 else str(round(dist))
-    return f"{name} {_DIR8[round(brg / 45) % 8]}쪽 {dist_txt}마일"
+        d = _hav_nm(lat, lon, rlat, rlon)
+        if best is None or d < best[0]:
+            best = (d, name, rlat, rlon)
+    if best is None:
+        return None
+    d, name, rlat, rlon = best
+    brg = _bearing(rlat, rlon, lat, lon)
+    label = _port_label(name)
+    dist_txt = f"{d:.1f}" if d < 10 else str(round(d))
+    return {"name": label, "거리": round(d, 2), "방위": round(brg),
+            "dir8": _DIR8[round(brg / 45) % 8],
+            "text": f"{label} {_DIR8[round(brg / 45) % 8]}쪽 {dist_txt}마일"}
+
+
+def _rel_position(lat, lon) -> str:
+    """사고 좌표 → '○○ ○쪽 N마일'(섬은 외곽선 기준). 좌표 없으면 ''."""
+    d = _rel_position_detail(lat, lon)
+    return d["text"] if d else ""
+
+
+@app.get("/relpos")
+def relpos():
+    """사고 좌표의 기준점 상대위치(섬 외곽선 기준). 프론트/카카오 공용."""
+    try:
+        lat = float(request.args["lat"]); lon = float(request.args["lon"])
+    except (KeyError, ValueError):
+        return jsonify({"error": "lat, lon 파라미터가 필요합니다"}), 400
+    d = _rel_position_detail(lat, lon)
+    if not d:
+        return jsonify({"error": "계산 불가"}), 422
+    return jsonify(d)
 
 
 def _add_hemisphere(loc: str) -> str:

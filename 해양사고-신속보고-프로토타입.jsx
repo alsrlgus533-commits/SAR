@@ -721,10 +721,20 @@ export default function App() {
 
     setSrc({ vessel: vSrc, wx: wSrc, route: rSrc });
     // ── 기준점 상대위치 자동 계산 (신고문 좌표 우선, 없으면 VMS 실시간 좌표) ──
+    // backend /relpos가 가장 가까운 기항지(항구) 기준으로 '○○항' 표기로 계산. 실패 시 클라이언트 폴백.
     let 상대위치 = "";
     const ll = extractLatLon(parsed.사고위치 || "") || vll;
     if (ll && ll.lat != null && ll.lon != null) {
-      상대위치 = relPosition(ll.lat, ll.lon, cfg.refPoints) || "";
+      try {
+        const base = (cfg.proxy || "http://localhost:8000").replace(/\/$/, "");
+        const rp = await fetch(`${base}/relpos?lat=${ll.lat}&lon=${ll.lon}`);
+        if (rp.ok) {
+          const j = await rp.json();
+          const dm = j.거리 < 10 ? j.거리.toFixed(1) : Math.round(j.거리);
+          상대위치 = `${j.name} ${j.dir8}방 약 ${dm}마일(방위 ${j.방위}°)`;
+        }
+      } catch (e) { /* 백엔드 미연결 → 폴백 */ }
+      if (!상대위치) 상대위치 = relPosition(ll.lat, ll.lon, cfg.refPoints) || "";
       if (상대위치) setMsgs((m) => [...m, { who: "api", text: `기준점 상대위치 자동 계산 → ${상대위치}`, live: true }]);
     }
     // 신고문에 위치가 없고 AIS로 현위치를 얻었으면 사고위치 칸에 좌표를 표기
