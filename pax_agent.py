@@ -69,6 +69,17 @@ def _to_int(s):
     return int(m.group(0).replace(",", "")) if m else None
 
 
+def _to_num(s):
+    """'12.5 M/T', '1,234.0', '' → 실수 또는 None (화물 M/T용, 소수 보존)."""
+    if s is None:
+        return None
+    m = re.search(r"-?\d[\d,]*\.?\d*", str(s))
+    if not m:
+        return None
+    v = float(m.group(0).replace(",", ""))
+    return int(v) if v == int(v) else v
+
+
 def _looks_like_login(html: str) -> bool:
     """응답이 로그인 화면이면 True(세션 만료 감지용) — 화면에 맞게 키워드 조정."""
     h = html or ""
@@ -129,21 +140,28 @@ def parse_vessel_list(html: str):
 
 # ── 사이트별 맞춤 ② 센터별 상세에서 승선인원 파싱 ═══════════════════════
 def parse_pax_detail(html: str):
-    """상세 화면 HTML → {"여객":int|None, "승무원":..., "차량":..., "대인":..., "소인":..., "유아":...}.
+    """상세 화면 HTML → {"여객":int|None, "승무원":.., "차량":.., "화물":float|int|None, "대인":.., "소인":.., "유아":..}.
 
-    실제 라벨(예: '승선인원', '여객', '선원', '차량')에 맞춰 정규식을 확정한다.
+    실제 라벨(예: '승선인원', '여객', '선원', '차량', '화물')에 맞춰 정규식을 확정한다.
+    화물은 실적재중량(M/T)이라 소수일 수 있어 _to_num 으로 뽑는다.
     """
     text = _strip_tags(html)
 
     def near(label):
-        # '여객 31명' / '여객: 31' 등 라벨 뒤 첫 숫자
+        # '여객 31명' / '여객: 31' 등 라벨 뒤 첫 숫자(정수)
         m = re.search(label + r"\s*[:：]?\s*(-?\d[\d,]*)", text)
         return _to_int(m.group(1)) if m else None
+
+    def near_num(label):
+        # '화물 12.5 M/T' / '적재중량: 12.5' 등 라벨 뒤 첫 숫자(소수 허용)
+        m = re.search(label + r"\s*[:：]?\s*(-?\d[\d,]*\.?\d*)", text)
+        return _to_num(m.group(1)) if m else None
 
     return {
         "여객": near("여객") or near("승객"),
         "승무원": near("선원") or near("승무원"),
         "차량": near("차량"),
+        "화물": near_num("화물") or near_num("적재중량") or near_num("실적재"),
         "대인": near("대인") or near("성인"),
         "소인": near("소인") or near("소아"),
         "유아": near("유아"),
@@ -171,7 +189,7 @@ def push(name: str, code: str, fields: dict) -> bool:
     """결과를 백엔드 /pax 로 전송. 값이 하나도 없으면 건너뜀."""
     body = {"name": name, "선박코드": code or "", "token": PAX_TOKEN,
             **{k: v for k, v in fields.items() if v is not None}}
-    if all(body.get(k) is None for k in ("여객", "승무원", "차량", "대인", "소인", "유아")):
+    if all(body.get(k) is None for k in ("여객", "승무원", "차량", "화물", "대인", "소인", "유아")):
         return False
     try:
         r = requests.post(BACKEND_PAX_URL, json=body, timeout=HTTP_TIMEOUT,

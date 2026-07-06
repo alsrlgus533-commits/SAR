@@ -697,13 +697,21 @@ PAX_TTL = int(os.environ.get("PAX_TTL", 64800))                              # '
 
 _PAX = {}                       # canonical_key -> entry
 _PAX_LOCK = threading.Lock()
-_PAX_FIELDS = ("여객", "대인", "소인", "유아", "승무원", "차량")
+_PAX_FIELDS = ("여객", "대인", "소인", "유아", "승무원", "차량", "화물")   # 화물=실적재중량(M/T)
 
 
 def _pax_norm(name: str) -> str:
     """선박명 정규화(공백·끝'호' 제거, 대문자) — 한글/영문 키 매칭용."""
     s = re.sub(r"\s+", "", str(name or "")).upper()
     return re.sub(r"호$", "", s)
+
+
+def _fmt_mt(s):
+    """화물 중량 표기 정리: 12.0→'12', 12.50→'12.5', 비수치는 원문."""
+    try:
+        return f"{float(s):,.1f}".rstrip("0").rstrip(".")
+    except (TypeError, ValueError):
+        return str(s).strip()
 
 
 def _pax_load():
@@ -739,7 +747,13 @@ def _pax_set(cd, name, fields, memo=""):
         v = fields.get(k)
         if v is not None and str(v).strip() != "":
             try:
-                entry[k] = int(float(v))
+                if k == "화물":                                   # 화물은 M/T 소수 보존('12.5 M/T' 등 단위 허용)
+                    m = re.search(r"-?\d[\d,]*\.?\d*", str(v))
+                    if m:
+                        fv = float(m.group(0).replace(",", ""))
+                        entry[k] = int(fv) if fv == int(fv) else fv
+                else:
+                    entry[k] = int(float(v))
             except (TypeError, ValueError):
                 pass
     with _PAX_LOCK:
@@ -790,6 +804,7 @@ def pax_submit():
         "유아": body.get("유아", body.get("infant")),
         "승무원": body.get("승무원", body.get("crew")),
         "차량": body.get("차량", body.get("vehicle")),
+        "화물": body.get("화물", body.get("cargo")),      # 실적재중량 M/T
     }
     if all(v is None or str(v).strip() == "" for v in fields.values()):
         return jsonify({"error": "여객수 등 값이 최소 하나는 필요합니다"}), 400
@@ -850,12 +865,13 @@ _PAX_SEND_HTML = """<!doctype html><html lang="ko"><head><meta charset="utf-8">
  <div><label>소인</label><input id="child" type="number" inputmode="numeric" min="0"></div>
  <div><label>유아</label><input id="infant" type="number" inputmode="numeric" min="0"></div>
 </div>
+<label>화물 <span class="hint">(실적재중량 M/T — 소수 가능)</span></label><input id="cargo" type="number" inputmode="decimal" min="0" step="0.1">
 <label>메모 <span class="hint">(예: ○○항 출항 후)</span></label><input id="memo" placeholder="선택">
 <label>전송 토큰 <span class="hint">(관리자에게 받은 값 — 1회 입력 후 저장됨)</span></label><input id="token" type="password" autocomplete="off">
 <button id="send">전송</button>
 <div id="msg"></div>
 <h2>현재 저장된 값</h2>
-<table id="cur"><thead><tr><th>선박</th><th>여객</th><th>승무원</th><th>차량</th><th>경과</th></tr></thead><tbody></tbody></table>
+<table id="cur"><thead><tr><th>선박</th><th>여객</th><th>승무원</th><th>차량</th><th>화물</th><th>경과</th></tr></thead><tbody></tbody></table>
 <script>
 const $=id=>document.getElementById(id);
 $("token").value=localStorage.getItem("paxToken")||"";
@@ -867,7 +883,7 @@ async function refresh(){
   const tb=$("cur").querySelector("tbody");tb.innerHTML="";
   (d.items||[]).forEach(it=>{const tr=document.createElement("tr");if(!it.신선)tr.className="stale";
    const ag=it.갱신경과초<3600?Math.round(it.갱신경과초/60)+"분 전":Math.round(it.갱신경과초/3600)+"시간 전";
-   tr.innerHTML=`<td>${it.선박명||it.선박코드||"-"}</td><td>${it.여객??"-"}</td><td>${it.승무원??"-"}</td><td>${it.차량??"-"}</td><td>${ag}</td>`;
+   tr.innerHTML=`<td>${it.선박명||it.선박코드||"-"}</td><td>${it.여객??"-"}</td><td>${it.승무원??"-"}</td><td>${it.차량??"-"}</td><td>${it.화물??"-"}</td><td>${ag}</td>`;
    tb.appendChild(tr);});
  }catch(e){}
 }
@@ -876,7 +892,7 @@ $("send").onclick=async()=>{
  if(!name&&!$("cd").value.trim()){show("선박명을 입력하세요",false);return;}
  const token=$("token").value.trim();localStorage.setItem("paxToken",token);
  const body={name,선박코드:$("cd").value.trim(),token,
-  여객:val("pax"),승무원:val("crew"),차량:val("veh"),
+  여객:val("pax"),승무원:val("crew"),차량:val("veh"),화물:val("cargo"),
   대인:val("adult"),소인:val("child"),유아:val("infant"),메모:$("memo").value.trim()};
  try{const r=await fetch("/pax",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
   const d=await r.json();
@@ -1711,9 +1727,13 @@ def _build_report_text(utterance: str) -> str:
         veh = pax_ovr.get("차량")
         if veh is None and mtis:
             veh = mtis.get("차량")
-        cargo, lmt = (mtis or {}).get("화물적재중량", ""), (mtis or {}).get("화물적재한도", "")
+        cargo = pax_ovr.get("화물")                       # 회사 실시간 실적재중량 우선
+        cargo_rt = cargo is not None
+        if not cargo_rt:
+            cargo = (mtis or {}).get("화물적재중량", "")
+        lmt = (mtis or {}).get("화물적재한도", "")
         cargo_txt = " · ".join(x for x in (
-            f"적재 {cargo} M/T" if cargo else "",
+            f"적재 {_fmt_mt(cargo)} M/T{'(실시간)' if cargo_rt else ''}" if cargo not in ("", None) else "",
             f"적재한도 {lmt} M/T" if lmt else "",
             f"차량 {veh}대" if veh else "",
         ) if x)
@@ -2356,15 +2376,11 @@ def _build_report_data(utterance: str, extra: dict = None, center: str = "") -> 
         "summary": summary,
     })
 
-    # 화물 — 실제 적재량 + 운항관리규정상 적재한도(MTIS 출항전 점검표) 병기
-    def _fmt_mt(s):
-        try:
-            return f"{float(s):,.1f}".rstrip("0").rstrip(".")
-        except (TypeError, ValueError):
-            return str(s).strip()
-    # 선박제원 화물칸 = 운항관리규정상 적재한도 값만 표출(다른 글자 없이). 없으면 실제 적재량 폴백.
+    # 화물 — 선박제원 화물칸 = 운항관리규정상 적재한도 값만 표출(다른 글자 없이).
+    # 없으면 회사 실시간 실적재중량 > MTIS 실적재중량 순으로 폴백. (_fmt_mt는 모듈 헬퍼)
     cargo_lmt = str((mtis or {}).get("화물적재한도") or "").strip()
-    cargo_mt = str((mtis or {}).get("화물적재중량") or "").strip()
+    cargo_rt = pax_ovr.get("화물") if pax_ovr else None
+    cargo_mt = str(cargo_rt if cargo_rt is not None else ((mtis or {}).get("화물적재중량") or "")).strip()
     cargo_val = cargo_lmt or cargo_mt
     cargo = f"{_fmt_mt(cargo_val)} M/T" if cargo_val else "없음"
 
