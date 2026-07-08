@@ -580,7 +580,8 @@ def weather():
         request.args.get("lat", ""),
         request.args.get("lon", ""),
     )
-    return jsonify(d), d.pop("_status", 200)
+    status = d.pop("_status", 200)   # 내부 상태코드는 응답 본문에서 제거 후 사용
+    return jsonify(d), status
 
 
 # ── /predep (MTIS 출항전 안전점검표 — 실제 승선인원/화물) ──────────────
@@ -1017,31 +1018,6 @@ def _llm_edit(field: str, current: str, instruction: str) -> str:
         return ""
 
 
-def _llm_edit_multi(report: str, instruction: str):
-    """LLM으로 개요·조치사항을 한 지시로 동시 편집. {'개요':.., '조치사항':..} 반환, 실패 시 None."""
-    cur_o, cur_a = _get_field(report, "개요"), _get_field(report, "조치사항")
-    prompt = (
-        "해양사고 1차 보고서의 '개요'와 '조치사항'을 운항관리자 지시대로 수정한다.\n"
-        f"현재 개요: \"{cur_o}\"\n현재 조치사항: \"{cur_a}\"\n"
-        f"운항관리자 지시: \"{instruction}\"\n"
-        "수정 결과를 JSON으로만 출력하라: {\"개요\":\"...\",\"조치사항\":\"...\"}\n"
-        "지시에 언급되지 않은 항목은 현재 값을 그대로 유지한다. 설명·마크다운 없이 JSON만."
-    )
-    try:
-        if GEMINI_KEY:
-            raw = _gemini_generate(prompt)
-        elif ANTHROPIC_KEY:
-            raw = _claude_generate(prompt)
-        else:
-            return None
-        raw = (raw or "").replace("```json", "").replace("```", "").strip()
-        d = json.loads(raw)
-        return {"개요": (str(d.get("개요", cur_o)).strip() or cur_o),
-                "조치사항": (str(d.get("조치사항", cur_a)).strip() or cur_a)}
-    except Exception:
-        return None
-
-
 @app.post("/parse")
 def parse_text():
     body = request.get_json(force=True, silent=True) or {}
@@ -1051,13 +1027,17 @@ def parse_text():
     if not (GEMINI_KEY or ANTHROPIC_KEY):
         return jsonify({"error": "GEMINI_KEY 또는 ANTHROPIC_KEY가 설정되지 않았습니다"}), 503
 
-    # Gemini 키가 있으면 Gemini, 없으면 Claude 사용
-    try:
-        raw = _gemini_parse(text) if GEMINI_KEY else _claude_parse(text)
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        return jsonify(json.loads(raw))
-    except Exception as exc:
-        return jsonify({"error": str(exc)}), 502
+    # Gemini 우선, 실패(429 등) 시 Claude 폴백 — 둘 다 실패해야 502 (_parse_nl과 동일한 체인)
+    last_exc = None
+    for fn, key in ((_gemini_parse, GEMINI_KEY), (_claude_parse, ANTHROPIC_KEY)):
+        if not key:
+            continue
+        try:
+            raw = fn(text).replace("```json", "").replace("```", "").strip()
+            return jsonify(json.loads(raw))
+        except Exception as exc:
+            last_exc = exc
+    return jsonify({"error": str(last_exc)}), 502
 
 
 # ── 자연어 파싱(서버측) — LLM 시도 후 규칙 기반 폴백 ──────────
@@ -1592,14 +1572,14 @@ def _rel_position_detail(lat, lon):
 
 
 def _rel_position(lat, lon) -> str:
-    """사고 좌표 → '○○ ○쪽 N마일'(섬은 외곽선 기준). 좌표 없으면 ''."""
+    """사고 좌표 → '○○항 ○쪽 N마일'(가장 가까운 기항지 기준). 좌표 없으면 ''."""
     d = _rel_position_detail(lat, lon)
     return d["text"] if d else ""
 
 
 @app.get("/relpos")
 def relpos():
-    """사고 좌표의 기준점 상대위치(섬 외곽선 기준). 프론트/카카오 공용."""
+    """사고 좌표의 상대위치(가장 가까운 기항지 '○○항' 기준). 프론트/카카오 공용."""
     try:
         lat = float(request.args["lat"]); lon = float(request.args["lon"])
     except (KeyError, ValueError):
@@ -1635,31 +1615,38 @@ def _build_report_text(utterance: str) -> str:
     crew = str(parsed.get("승무원") or "").strip()
     summary = str(parsed.get("사고개요") or "").strip()
 
-    vessel = route_info = mtis = None
+    lat, lon = _extract_latlon(loc)
+
+    # 외부 조회 병렬 실행(_build_report_data와 동일 패턴) — 순차 합산 지연을 최댓값으로 단축.
+    # 의존관계: predep ← vessel(선박코드), weather ← 최종 좌표(신고 or VMS), 나머지는 독립.
+    def _try(fn, *a):
+        try:
+            return fn(*a)
+        except Exception:
+            return None
+
+    vessel = route_info = mtis = vpos = None
     cd = ""
-    if ship:
-        try:
-            vessel = _vessel_lookup(ship)
-        except Exception:
-            vessel = None
-        try:
-            route_info = _route_lookup(ship)
-        except Exception:
-            route_info = None
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        f_vessel = ex.submit(_try, _vessel_lookup, ship) if ship else None
+        f_route = ex.submit(_try, _route_lookup, ship) if ship else None
+        f_vpos = ex.submit(_vms_position_safe, ship) if ship else None
+
+        vessel = f_vessel.result() if f_vessel else None
         # MTIS 출항전 점검표 — 실제 승선인원·화물 (KOMSA 선박코드 필요)
         cd = (vessel or {}).get("선박코드", "")
-        if cd:
-            try:
-                mtis = _predep_lookup(cd)
-            except Exception:
-                mtis = None
+        f_predep = ex.submit(_try, _predep_lookup, cd) if cd else None
 
-    vpos = _vms_position_safe(ship)
-    lat, lon = _extract_latlon(loc)
-    if lat is None and vpos and vpos.get("위도") is not None:   # 신고 좌표 없으면 AIS 현위치로 기상조회
-        lat, lon = vpos["위도"], vpos["경도"]
+        vpos = f_vpos.result() if f_vpos else None
+        if lat is None and vpos and vpos.get("위도") is not None:   # 신고 좌표 없으면 AIS 현위치로 기상조회
+            lat, lon = vpos["위도"], vpos["경도"]
+        f_wx = ex.submit(_weather_lookup, loc, "" if lat is None else str(lat),
+                         "" if lon is None else str(lon))   # 최종 좌표 확정 후 제출(VMS 결과 반영)
+
+        route_info = f_route.result() if f_route else None
+        mtis = f_predep.result() if f_predep else None
+        wx = f_wx.result()
     have_coord = lat is not None
-    wx = _weather_lookup(loc, "" if lat is None else str(lat), "" if lon is None else str(lon))
     if wx.get("error"):
         wx = None
 
@@ -2323,7 +2310,6 @@ def _build_report_data(utterance: str, extra: dict = None, center: str = "") -> 
 
     # 현지기상
     if wx:
-        wx_aws = wx.get("AWS") or {}
         wparts = [f"풍향({wx.get('풍향','-')})", f"풍속({wx.get('풍속','-')})",
                   f"파고({wx.get('파고','-')})", "시정(양호)"]
         weather = ", ".join(wparts)
@@ -2678,19 +2664,21 @@ def report_hwpx():
 # 공개 다운로드 URL을 카드 버튼으로 전달한다(1시간 후 만료).
 
 _REPORT_FILES = {}            # token -> (blob, filename, expires_at)
+_REPORT_FILES_LOCK = threading.Lock()   # 카카오 백그라운드 스레드·요청 스레드 동시 접근 보호
 _REPORT_FILES_TTL = 3600      # 1시간
 _REPORT_FILES_MAX = 200
 
 
 def _store_report_file(blob: bytes, filename: str) -> str:
     now = time.time()
-    for k in [k for k, v in _REPORT_FILES.items() if v[2] < now]:   # 만료분 정리
-        _REPORT_FILES.pop(k, None)
-    if len(_REPORT_FILES) > _REPORT_FILES_MAX:
-        for k in list(_REPORT_FILES)[:-_REPORT_FILES_MAX]:
-            _REPORT_FILES.pop(k, None)
     token = secrets.token_urlsafe(16)
-    _REPORT_FILES[token] = (blob, filename, now + _REPORT_FILES_TTL)
+    with _REPORT_FILES_LOCK:
+        for k in [k for k, v in _REPORT_FILES.items() if v[2] < now]:   # 만료분 정리
+            _REPORT_FILES.pop(k, None)
+        if len(_REPORT_FILES) > _REPORT_FILES_MAX:
+            for k in list(_REPORT_FILES)[:-_REPORT_FILES_MAX]:
+                _REPORT_FILES.pop(k, None)
+        _REPORT_FILES[token] = (blob, filename, now + _REPORT_FILES_TTL)
     return token
 
 
@@ -2706,9 +2694,12 @@ def _public_base() -> str:
 
 @app.get("/report/download/<token>")
 def report_download(token):
-    item = _REPORT_FILES.get(token)
-    if not item or item[2] < time.time():
-        _REPORT_FILES.pop(token, None)
+    with _REPORT_FILES_LOCK:
+        item = _REPORT_FILES.get(token)
+        if item and item[2] < time.time():
+            _REPORT_FILES.pop(token, None)
+            item = None
+    if not item:
         return Response("다운로드 링크가 만료되었거나 잘못되었습니다. 챗봇에서 다시 요청해 주세요.",
                         status=404, mimetype="text/plain; charset=utf-8")
     blob, filename, _ = item

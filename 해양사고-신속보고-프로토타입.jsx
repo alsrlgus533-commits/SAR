@@ -455,8 +455,13 @@ function ruleParse(text) {
   if (/부유물|폐그물|감김|감겨/.test(text)) summary = "부유물(폐그물) 프로펠러 감김으로 자력 항해 불가";
   else if (/이물질/.test(text)) summary = `${(text.match(/(좌현|우현|중앙)?\s*추진기/) || ["추진기"])[0].trim()} 이물질 걸림으로 자력 항해 불가`;
   else if (/좌초/.test(text)) summary = "좌초 발생";
+  else if (/좌주/.test(text)) summary = "좌주 발생";
   else if (/충돌/.test(text)) summary = "충돌 발생";
   else if (/화재/.test(text)) summary = "화재 발생";
+  else if (/침수/.test(text)) summary = "침수 발생";
+  else if (/전복/.test(text)) summary = "전복 발생";
+  else if (/타기|조타|조향|러더/.test(text)) summary = "조타장치(타기) 고장";
+  else if (/추진기|프로펠러|스크류/.test(text)) summary = "추진기 고장으로 자력 항해 불가";
   else if (/기관|엔진/.test(text)) summary = "기관 고장으로 자력 항해 불가";
   else if (/정선|표류/.test(text)) summary = "자력 항해 불가 (정선·표류)";
   return { 선박명: ship, 사고위치: [pos, area].filter(Boolean).join(" / "), 여객: pax, 승무원: crew, 사고개요: summary || text.slice(0, 60) };
