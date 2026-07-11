@@ -1710,7 +1710,7 @@ def _build_report_text(utterance: str) -> str:
         if crew_v is None and mtis:
             crew_v = mtis.get("승무원")
         L.append(f"▶ 승선: 여객 {pax_v if pax_v is not None else (pax or '?')}명{detail}, "
-                 f"선원 {crew_v if crew_v is not None else (crew or '?')}명 (회사 실시간 현황)")
+                 f"선원 {crew_v if crew_v is not None else (crew or '?')}명")
         veh = pax_ovr.get("차량")
         if veh is None and mtis:
             veh = mtis.get("차량")
