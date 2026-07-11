@@ -1720,7 +1720,7 @@ def _build_report_text(utterance: str) -> str:
             cargo = (mtis or {}).get("화물적재중량", "")
         lmt = (mtis or {}).get("화물적재한도", "")
         cargo_txt = " · ".join(x for x in (
-            f"적재 {_fmt_mt(cargo)} M/T{'(실시간)' if cargo_rt else ''}" if cargo not in ("", None) else "",
+            f"적재 {_fmt_mt(cargo)} M/T" if cargo not in ("", None) else "",
             f"적재한도 {lmt} M/T" if lmt else "",
             f"차량 {veh}대" if veh else "",
         ) if x)
