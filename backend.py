@@ -2076,6 +2076,46 @@ _ACC_TYPES = [
     (r"오염|기름|유출", "해양오염"), (r"안전사고|부상|추락", "안전사고"),
 ]
 
+_ACCIDENT_TYPE_LABELS = (
+    "충돌", "접촉", "좌초", "전복", "화재", "폭발", "침몰", "행방불명", "기관손상",
+    "추진축계손상", "조타장치손상", "속구손상", "침수", "부유물감김", "운항저해",
+    "해양오염", "안전사고", "기타",
+)
+
+# 중앙해양안전심판원 분류에 따른 사고 원인 23종. 보고서에는 분류번호 없이 명칭만 표기한다.
+_ACCIDENT_CAUSE_LABELS = (
+    "선장업무 소홀(조선미숙 등)", "견시 소홀", "정비점검 소홀", "당직근무 소홀",
+    "부적절한 충돌회피(조선)", "무리한 운항(기상)", "선위 부정확", "근접 항해",
+    "추월 위반", "안전업무 소홀", "선저 파공(누수)", "기관계통 고장", "전기계통 고장",
+    "항해계기 고장", "선박속구 고장", "기상악화", "해상 부유물",
+    "외부 발화원(차량/화물)", "지병", "과로", "자살(추정)", "여객 부주의", "기타",
+)
+
+_ACCIDENT_CAUSE_PATTERNS = (
+    (r"선저\s*파공|누수", "선저 파공(누수)"),
+    (r"해상\s*부유물|부유물|폐그물|폐로프|로프.*감|감김|감겨", "해상 부유물"),
+    (r"외부\s*발화|차량.*화재|화물.*화재", "외부 발화원(차량/화물)"),
+    (r"전기|배전|발전기|축전지", "전기계통 고장"),
+    (r"항해계기|레이더|GPS|AIS|나침반", "항해계기 고장"),
+    (r"선박속구|속구", "선박속구 고장"),
+    (r"기관계통|기관|엔진|주기관|보조기관|펌프|추진축|축계|추진기", "기관계통 고장"),
+    (r"기상악화|황천|풍랑|태풍", "기상악화"),
+    (r"무리한\s*운항", "무리한 운항(기상)"),
+    (r"충돌회피|피항.*부적절|부적절.*조선", "부적절한 충돌회피(조선)"),
+    (r"선위.*부정확|위치.*오인", "선위 부정확"),
+    (r"근접\s*항해", "근접 항해"),
+    (r"추월.*위반", "추월 위반"),
+    (r"정비.*소홀|점검.*소홀|정비점검", "정비점검 소홀"),
+    (r"견시.*소홀|전방주시.*소홀", "견시 소홀"),
+    (r"당직.*소홀", "당직근무 소홀"),
+    (r"선장.*소홀|조선미숙", "선장업무 소홀(조선미숙 등)"),
+    (r"안전업무.*소홀|안전조치.*소홀", "안전업무 소홀"),
+    (r"여객.*부주의", "여객 부주의"),
+    (r"자살", "자살(추정)"),
+    (r"과로", "과로"),
+    (r"지병|질병", "지병"),
+)
+
 
 def _vessel_master(name: str = "", code: str = "") -> dict:
     """선박마스터.csv(회사 보유: 보험·선박번호·선적항·검사기관·국적·사진파일명) 조회.
@@ -2179,12 +2219,39 @@ def _accident_type(summary: str, utterance: str) -> str:
     return "기타"
 
 
+def _classification_name(value: str) -> str:
+    """'12 기관계통 고장', '12. 기관계통 고장' 같은 응답에서 분류번호를 제거한다."""
+    return re.sub(r"^\s*\d+\s*[.)번:-]?\s*", "", str(value or "")).strip()
+
+
+def _normalize_accident_type(value: str, summary: str = "", utterance: str = "") -> str:
+    raw = _classification_name(value)
+    if raw in _ACCIDENT_TYPE_LABELS:
+        return raw
+    for label in _ACCIDENT_TYPE_LABELS[:-1]:
+        if label in raw:
+            return label
+    return _accident_type(summary, utterance)
+
+
+def _accident_cause(value: str = "", utterance: str = "", summary: str = "") -> str:
+    """어떤 입력도 공식 사고원인 명칭 하나로 정규화하며 분류번호는 출력하지 않는다."""
+    raw = _classification_name(value)
+    if raw in _ACCIDENT_CAUSE_LABELS:
+        return raw
+    blob = " ".join(x for x in (raw, summary, utterance) if x)
+    for pattern, label in _ACCIDENT_CAUSE_PATTERNS:
+        if re.search(pattern, blob, re.I):
+            return label
+    return "기타"
+
+
 def _infer_fallback(utterance: str, summary: str) -> dict:
     """공폼 추정 항목의 안전 기본값(LLM 미설정/실패 시). _infer_report_fields·_parse_and_infer 공용."""
     now_hm = datetime.now(timezone(timedelta(hours=9))).strftime("%H:%M")
     return {
         "사고종류": _accident_type(summary, utterance),
-        "추정원인": "확인 중",
+        "추정원인": _accident_cause("", utterance, summary),
         "인명피해": "없음",
         "오염피해": "없음",
         "선박피해": "확인 중",
@@ -2197,10 +2264,12 @@ def _infer_fallback(utterance: str, summary: str) -> dict:
 def _merge_infer(d: dict, fallback: dict) -> dict:
     """LLM이 준 추정 dict를 기본값 위에 병합(빈 값은 무시, 조치사항/계획은 list화). 공용 헬퍼."""
     out = dict(fallback)
-    for k in ("사고종류", "추정원인", "인명피해", "오염피해", "선박피해", "지연시간"):
+    for k in ("인명피해", "오염피해", "선박피해", "지연시간"):
         v = str(d.get(k, "") or "").strip()
         if v:
             out[k] = v
+    out["사고종류"] = _normalize_accident_type(d.get("사고종류"), fallback.get("사고종류", "기타"), "")
+    out["추정원인"] = _accident_cause(d.get("추정원인"), "", fallback.get("추정원인", "기타"))
     for k in ("조치사항", "조치계획"):
         v = d.get(k)
         if isinstance(v, list) and v:
@@ -2222,12 +2291,13 @@ def _infer_report_fields(utterance: str, ship: str, summary: str, extra: dict) -
         f"선박: {ship or '미상'}\n사고개요: {summary or utterance}\n신고 원문: {utterance}\n"
         f"운항관리자 보충 — 경위: {extra.get('경위','')} / 피해: {extra.get('피해','')} / 조치: {extra.get('조치','')}\n\n"
         "출력 형식(JSON, 설명·마크다운 금지):\n"
-        "{\"사고종류\":\"공폼 18종 중 하나(충돌/접촉/좌초/전복/화재/폭발/침몰/행방불명/기관손상/"
-        "추진축계손상/조타장치손상/속구손상/침수/부유물감김/운항저해/해양오염/안전사고/기타)\","
-        "\"추정원인\":\"한 줄\",\"인명피해\":\"없음 또는 내용\",\"오염피해\":\"없음 또는 내용\","
+        f"{{\"사고종류\":\"다음 18종 명칭 중 하나만, 번호 금지: {'/'.join(_ACCIDENT_TYPE_LABELS)}\","
+        f"\"추정원인\":\"다음 23종 명칭 중 하나만, 번호 금지: {'/'.join(_ACCIDENT_CAUSE_LABELS)}\","
+        "\"인명피해\":\"없음 또는 내용\",\"오염피해\":\"없음 또는 내용\","
         "\"선박피해\":\"없음/확인 중 또는 내용\",\"지연시간\":\"확인 중 또는 내용\","
         "\"조치사항\":[\"시각 포함 한 줄씩\"],\"조치계획\":[\"한 줄씩\"]}\n"
-        "확인되지 않은 항목은 공폼 관례대로 '확인 중' 또는 '없음'으로 적는다. 한국어로."
+        "사고종류와 추정원인에는 분류번호·설명문을 붙이지 않는다. 그 밖의 확인되지 않은 항목은 "
+        "공폼 관례대로 '확인 중' 또는 '없음'으로 적는다. 한국어로."
     )
     try:
         raw = _llm_text(prompt, 700)
@@ -2257,12 +2327,13 @@ def _parse_and_infer(utterance: str, extra: dict = None):
         "\"사고위치\":\"좌표·지명 포함, 모르면 빈문자열\","
         "\"여객\":\"숫자만 또는 빈문자열\",\"승무원\":\"숫자만 또는 빈문자열\","
         "\"사고개요\":\"한 문장\","
-        "\"사고종류\":\"공폼 18종 중 하나(충돌/접촉/좌초/전복/화재/폭발/침몰/행방불명/기관손상/"
-        "추진축계손상/조타장치손상/속구손상/침수/부유물감김/운항저해/해양오염/안전사고/기타)\","
-        "\"추정원인\":\"한 줄\",\"인명피해\":\"없음 또는 내용\",\"오염피해\":\"없음 또는 내용\","
+        f"\"사고종류\":\"다음 18종 명칭 중 하나만, 번호 금지: {'/'.join(_ACCIDENT_TYPE_LABELS)}\","
+        f"\"추정원인\":\"다음 23종 명칭 중 하나만, 번호 금지: {'/'.join(_ACCIDENT_CAUSE_LABELS)}\","
+        "\"인명피해\":\"없음 또는 내용\",\"오염피해\":\"없음 또는 내용\","
         "\"선박피해\":\"없음/확인 중 또는 내용\",\"지연시간\":\"확인 중 또는 내용\","
         "\"조치사항\":[\"시각 포함 한 줄씩\"],\"조치계획\":[\"한 줄씩\"]}\n"
-        "확인되지 않은 항목은 공폼 관례대로 '확인 중' 또는 '없음'으로. 한국어로."
+        "사고종류와 추정원인에는 분류번호·설명문을 붙이지 않는다. 그 밖의 확인되지 않은 항목은 "
+        "공폼 관례대로 '확인 중' 또는 '없음'으로. 한국어로."
     )
     try:
         raw = _llm_text(prompt, 900)
@@ -2677,9 +2748,12 @@ def _build_report_data(utterance: str, extra: dict = None, center: str = "", con
     if not photo and ship:
         photo = _komsa_vessel_photo(ship)
 
+    # 최종 출력 직전에도 공식 분류로 강제해 LLM 설명문·번호가 보고서에 새지 않게 한다.
+    accident_type = _normalize_accident_type(inf.get("사고종류"), summary, utterance)
+    accident_cause = _accident_cause(inf.get("추정원인"), utterance, summary)
     ph = "[미확인]"
     return {
-        "사고종류": inf["사고종류"],
+        "사고종류": accident_type,
         "기준일시": now.strftime("%Y년 %m월 %d일 %H:%M"),
         "보고센터": center or "운항관리센터",
         "사고개요": narr,
@@ -2700,7 +2774,7 @@ def _build_report_data(utterance: str, extra: dict = None, center: str = "", con
         "오염피해": inf["오염피해"],
         "선박피해": inf["선박피해"],
         "지연시간": inf["지연시간"],
-        "추정원인": inf["추정원인"],
+        "추정원인": accident_cause,
         "조치사항": inf["조치사항"],
         "조치계획": inf["조치계획"],
         "작성일자": f"{now.year}. {now.month}. {now.day}.",

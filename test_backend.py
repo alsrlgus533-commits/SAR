@@ -1,4 +1,5 @@
 import os
+import re
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
@@ -27,6 +28,24 @@ class ReportConfirmationTests(unittest.TestCase):
         base = datetime(2026, 7, 13, 18, 0, tzinfo=timezone(timedelta(hours=9)))
         dt = backend._extract_accident_datetime("오늘 09:05경 사고", now=base)
         self.assertEqual(dt.strftime("%Y-%m-%d %H:%M"), "2026-07-13 09:05")
+
+    def test_accident_cause_is_limited_to_official_names_without_list_number(self):
+        self.assertEqual(len(backend._ACCIDENT_CAUSE_LABELS), 23)
+        self.assertEqual(len(set(backend._ACCIDENT_CAUSE_LABELS)), 23)
+        self.assertTrue(all(not re.match(r"^\d", x) for x in backend._ACCIDENT_CAUSE_LABELS))
+        self.assertEqual(backend._accident_cause("17. 해상 부유물"), "해상 부유물")
+        self.assertEqual(backend._accident_cause("12 기관계통 고장으로 추정"), "기관계통 고장")
+        self.assertEqual(backend._accident_cause("", "폐그물 프로펠러 감김", ""), "해상 부유물")
+        self.assertEqual(backend._accident_cause("임의 설명문"), "기타")
+
+    def test_llm_classification_numbers_and_explanations_are_normalized(self):
+        fallback = backend._infer_fallback("엔진 고장", "주기관 정지")
+        merged = backend._merge_infer({
+            "사고종류": "9. 기관손상 - 주기관 고장",
+            "추정원인": "12번 기관계통 고장으로 판단됨",
+        }, fallback)
+        self.assertEqual(merged["사고종류"], "기관손상")
+        self.assertEqual(merged["추정원인"], "기관계통 고장")
 
     def test_missing_fields_and_formats_are_rejected(self):
         confirmed = {key: "값" for key in backend._REPORT_REQUIRED}
@@ -190,6 +209,9 @@ class ReportConfirmationTests(unittest.TestCase):
         self.assertIn("14:20경", data["사고개요"])
         self.assertIn("여객 28명", data["사고개요"])
         self.assertNotIn("○○", data["사고개요"])
+        self.assertIn(data["사고종류"], backend._ACCIDENT_TYPE_LABELS)
+        self.assertIn(data["추정원인"], backend._ACCIDENT_CAUSE_LABELS)
+        self.assertFalse(data["추정원인"][0].isdigit())
 
     def test_confirmed_data_composes_valid_hwpx(self):
         data = {
