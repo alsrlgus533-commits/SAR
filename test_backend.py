@@ -84,6 +84,36 @@ class ReportConfirmationTests(unittest.TestCase):
         finally:
             backend._SESSIONS.pop(uid, None)
 
+    def test_formal_report_reuses_all_values_shown_in_first_report(self):
+        first_report = """🚨 해양사고 1차(속보) — 자동작성
+
+▶ 선박: 한일골드스텔라 (카페리 · 15,195톤 · 정원 948명)
+▶ 발생: 2026-07-13 14:20
+▶ 출항시각: 13:40 (여수-제주)
+▶ 위치: 여수항 북동방 약 2마일
+▶ 승선: 여객 120명(성인 110·소아 8·유아 2), 선원 20명 (실승선 계 140명)
+▶ 개요: 주기관 고장으로 자력 항해 불가
+▶ 조치사항: 해경 보고
+"""
+        empty_parse = {"사고일시": "", "선박명": "", "사고위치": "", "여객": "",
+                       "승무원": "", "사고개요": ""}
+        with patch.object(backend, "_parse_nl", return_value=empty_parse), \
+             patch.object(backend, "_vessel_lookup") as vessel_lookup, \
+             patch.object(backend, "_route_lookup") as route_lookup:
+            confirmed = backend._prepare_report_confirmation("최초 신고문", first_report)
+
+        self.assertEqual(backend._pending_report_keys(confirmed), [])
+        self.assertEqual(confirmed["선박명"], "한일골드스텔라")
+        self.assertEqual(confirmed["사고일시"], "2026-07-13T14:20")
+        self.assertEqual(confirmed["항로"], "여수-제주")
+        self.assertEqual(confirmed["출항시각"], "13:40")
+        self.assertEqual(confirmed["여객"], "120")
+        self.assertEqual(confirmed["승무원"], "20")
+        self.assertEqual(confirmed["사고위치"], "여수항 북동방 약 2마일")
+        self.assertEqual(confirmed["사고개요"], "주기관 고장으로 자력 항해 불가")
+        vessel_lookup.assert_not_called()
+        route_lookup.assert_not_called()
+
     def test_narrative_rejects_missing_information_instead_of_omitting_it(self):
         with self.assertRaisesRegex(ValueError, "운항 항로"):
             backend._summary_narrative({

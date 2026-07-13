@@ -1985,10 +1985,11 @@ def kakao_skill():
             # 외부 API로 확정 후보를 준비하는 작업도 수초~수십초 걸릴 수 있으므로
             # 카카오 5초 제한 밖의 콜백 스레드에서 수행한다.
             threading.Thread(target=_kakao_prepare_hwpx_callback,
-                             args=(callback_url, uid, src_utt, base, sess.get("confirmed")), daemon=True).start()
+                             args=(callback_url, uid, src_utt, base,
+                                   sess.get("report"), sess.get("confirmed")), daemon=True).start()
             return jsonify({"version": "2.0", "useCallback": True,
                             "data": {"text": "📋 정식 보고서 필수정보를 확인 중입니다… 잠시만 기다려 주세요."}})
-        confirmed = sess.get("confirmed") or _prepare_report_confirmation(src_utt)
+        confirmed = _prepare_report_confirmation(src_utt, sess.get("report"), sess.get("confirmed"))
         pending = _pending_report_keys(confirmed)
         if pending:
             _session_set(uid, confirmed=confirmed, pending_fields=pending, mode="confirm_report_field")
@@ -2430,12 +2431,82 @@ def _normalize_confirm_answer(key: str, answer: str) -> str:
     return value
 
 
-def _prepare_report_confirmation(utterance: str) -> dict:
-    """카카오 원문과 연계 데이터로 확정 후보를 만들고, 빠진 값만 대화로 질문한다."""
-    parsed = _parse_nl(utterance)
-    ship = str(parsed.get("선박명") or "").strip()
-    vessel = route_info = mtis = None
+def _confirmation_from_first_report(report: str) -> dict:
+    """사용자에게 이미 보여준 1차 속보의 항목을 정식 보고서 확정 후보로 복원한다."""
+    text = str(report or "")
+    if not text:
+        return {}
+    out = {}
+
+    occurred = _get_field(text, "발생")
+    if occurred and "확인 필요" not in occurred:
+        out["사고일시"] = _accident_iso(occurred)
+
+    ship = _get_field(text, "선박")
     if ship:
+        out["선박명"] = ship.split(" (", 1)[0].strip()
+
+    loc = _get_field(text, "위치") or _get_field(text, "현재위치")
+    if loc:
+        # VMS 줄의 속력·침로·수신시각 꼬리는 위치값에서 제외한다.
+        out["사고위치"] = re.sub(r"\s*\[.*$", "", loc).strip()
+
+    departure = _get_field(text, "출항시각")
+    if departure:
+        tm = re.search(r"(?<!\d)([01]?\d|2[0-3]):([0-5]\d)", departure)
+        if tm:
+            out["출항시각"] = f"{int(tm.group(1)):02d}:{tm.group(2)}"
+        rm = re.search(r"\(([^()]*(?:-|~|∼|↔)[^()]*)\)", departure)
+        if rm:
+            out["항로"] = rm.group(1).strip()
+
+    route_line = _get_field(text, "항로")
+    if route_line and not out.get("항로"):
+        rm = re.search(r"(?:^|\s)운항\s+(.+?)(?:\s+·|$)", route_line)
+        if rm:
+            out["항로"] = rm.group(1).strip()
+
+    manifest = _get_field(text, "승선")
+    if manifest:
+        pax_m = re.search(r"여객\s+(\d+)\s*명", manifest)
+        crew_m = re.search(r"(?:선원|승무원)\s+(\d+)\s*명", manifest)
+        if pax_m:
+            out["여객"] = pax_m.group(1)
+        if crew_m:
+            out["승무원"] = crew_m.group(1)
+
+    summary = _get_field(text, "개요")
+    if summary:
+        out["사고개요"] = summary
+    return out
+
+
+def _prepare_report_confirmation(utterance: str, first_report: str = "",
+                                 existing_confirmed: dict = None) -> dict:
+    """1차 속보 → 기존 사용자 답변 → 원문/API 순으로 채우고, 진짜 누락값만 질문한다."""
+    parsed = _parse_nl(utterance)
+    candidate = {
+        "사고일시": _accident_iso(parsed.get("사고일시") or utterance),
+        "선박명": str(parsed.get("선박명") or "").strip(),
+        "사고위치": str(parsed.get("사고위치") or "").strip(),
+        "항로": "", "출항시각": "",
+        "여객": str(parsed.get("여객") or "").strip(),
+        "승무원": str(parsed.get("승무원") or "").strip(),
+        "사고개요": str(parsed.get("사고개요") or "").strip(),
+    }
+    # 이미 1차 보고서에 표출된 값이 재파싱 결과보다 우선한다.
+    candidate.update({k: v for k, v in _confirmation_from_first_report(first_report).items() if v != ""})
+    # 사용자가 누락 질문에 직접 답한 값은 가장 높은 우선순위로 보존한다.
+    candidate.update({k: str(v).strip() for k, v in (existing_confirmed or {}).items()
+                      if str(v).strip() != ""})
+
+    pending = _pending_report_keys(candidate)
+    if not pending:
+        return candidate
+
+    ship = candidate["선박명"]
+    vessel = route_info = mtis = None
+    if ship and any(k in pending for k in ("항로", "출항시각", "여객", "승무원")):
         with ThreadPoolExecutor(max_workers=2) as ex:
             fv = ex.submit(_vessel_lookup, ship)
             fr = ex.submit(_route_lookup, ship)
@@ -2453,23 +2524,20 @@ def _prepare_report_confirmation(utterance: str) -> dict:
                 mtis = _predep_lookup(cd)
             except Exception:
                 mtis = None
-    route = ((mtis or {}).get("항로") or (route_info or {}).get("운항항로")
-             or (route_info or {}).get("면허항로") or (vessel or {}).get("항로") or "")
+    route = str((mtis or {}).get("항로") or (route_info or {}).get("운항항로")
+                or (route_info or {}).get("면허항로") or (vessel or {}).get("항로") or "").strip()
     dep = str((mtis or {}).get("출항시간") or (route_info or {}).get("출발시각") or "").strip()
     if dep.isdigit():
         dep = f"{dep.zfill(4)[:2]}:{dep.zfill(4)[2:]}"
-    pax = str((mtis or {}).get("여객") or parsed.get("여객") or "").strip()
-    crew = str((mtis or {}).get("승무원") or parsed.get("승무원") or "").strip()
-    return {
-        "사고일시": _accident_iso(parsed.get("사고일시") or utterance),
-        "선박명": ship,
-        "사고위치": str(parsed.get("사고위치") or "").strip(),
-        "항로": str(route).strip(),
-        "출항시각": dep,
-        "여객": pax,
-        "승무원": crew,
-        "사고개요": str(parsed.get("사고개요") or "").strip(),
-    }
+    if "항로" in pending and route:
+        candidate["항로"] = route
+    if "출항시각" in pending and dep:
+        candidate["출항시각"] = dep
+    if "여객" in pending and (mtis or {}).get("여객") not in (None, ""):
+        candidate["여객"] = str(mtis["여객"])
+    if "승무원" in pending and (mtis or {}).get("승무원") not in (None, ""):
+        candidate["승무원"] = str(mtis["승무원"])
+    return candidate
 
 
 def _build_report_data(utterance: str, extra: dict = None, center: str = "", confirmed: dict = None) -> dict:
@@ -2972,14 +3040,15 @@ def _kakao_hwpx_callback(callback_url: str, uid: str, utterance: str, base: str,
 
 
 def _kakao_prepare_hwpx_callback(callback_url: str, uid: str, utterance: str,
-                                  base: str, existing_confirmed: dict = None):
+                                  base: str, first_report: str = "",
+                                  existing_confirmed: dict = None):
     """정식 보고서 준비도 비동기 처리해 카카오 스킬의 5초 응답 제한을 지킨다.
 
     누락값이 있으면 다운로드 파일 대신 첫 번째 확인 질문을 콜백으로 보내고,
     모두 확보됐으면 바로 hwpx 다운로드 카드를 보낸다.
     """
     try:
-        confirmed = existing_confirmed or _prepare_report_confirmation(utterance)
+        confirmed = _prepare_report_confirmation(utterance, first_report, existing_confirmed)
         pending = _pending_report_keys(confirmed)
         if pending:
             _session_set(uid, confirmed=confirmed, pending_fields=pending,
