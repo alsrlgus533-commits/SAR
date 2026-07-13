@@ -116,7 +116,7 @@ class ReportConfirmationTests(unittest.TestCase):
 """
         empty_parse = {"사고일시": "", "선박명": "", "사고위치": "", "여객": "",
                        "승무원": "", "사고개요": ""}
-        with patch.object(backend, "_parse_nl", return_value=empty_parse), \
+        with patch.object(backend, "_parse_nl", return_value=empty_parse) as parse_nl, \
              patch.object(backend, "_vessel_lookup") as vessel_lookup, \
              patch.object(backend, "_route_lookup") as route_lookup:
             confirmed = backend._prepare_report_confirmation("최초 신고문", first_report)
@@ -130,8 +130,48 @@ class ReportConfirmationTests(unittest.TestCase):
         self.assertEqual(confirmed["승무원"], "20")
         self.assertEqual(confirmed["사고위치"], "여수항 북동방 약 2마일")
         self.assertEqual(confirmed["사고개요"], "주기관 고장으로 자력 항해 불가")
+        parse_nl.assert_not_called()
         vessel_lookup.assert_not_called()
         route_lookup.assert_not_called()
+
+    def test_formal_report_reparses_only_when_first_report_lacks_source_fields(self):
+        first_report = """🚨 해양사고 1차(속보) — 자동작성
+
+▶ 선박: 시험호
+▶ 발생: 2026-07-13 14:20
+▶ 위치: 추자항 북동방 2해리
+▶ 승선: 여객 28명, 선원 4명
+"""
+        parsed = {
+            "사고일시": "", "선박명": "", "사고위치": "",
+            "여객": "", "승무원": "", "사고개요": "기관 고장으로 자력 항해 불가",
+        }
+        with patch.object(backend, "_parse_nl", return_value=parsed) as parse_nl, \
+             patch.object(backend, "_vessel_lookup", return_value=None), \
+             patch.object(backend, "_route_lookup", return_value=None):
+            confirmed = backend._prepare_report_confirmation("시험호 기관 고장", first_report)
+
+        parse_nl.assert_called_once_with("시험호 기관 고장")
+        self.assertEqual(confirmed["사고개요"], "기관 고장으로 자력 항해 불가")
+
+    def test_formal_report_skips_reparse_when_only_lookup_fields_are_missing(self):
+        first_report = """🚨 해양사고 1차(속보) — 자동작성
+
+▶ 선박: 시험호
+▶ 발생: 2026-07-13 14:20
+▶ 위치: 추자항 북동방 2해리
+▶ 승선: 여객 28명, 선원 4명
+▶ 개요: 기관 고장으로 자력 항해 불가
+"""
+        with patch.object(backend, "_parse_nl") as parse_nl, \
+             patch.object(backend, "_vessel_lookup", return_value={"선박코드": "TEST"}), \
+             patch.object(backend, "_route_lookup", return_value={"운항항로": "목포-제주", "출발시각": "1340"}), \
+             patch.object(backend, "_predep_lookup", return_value=None):
+            confirmed = backend._prepare_report_confirmation("시험호 기관 고장", first_report)
+
+        parse_nl.assert_not_called()
+        self.assertEqual(confirmed["항로"], "목포-제주")
+        self.assertEqual(confirmed["출항시각"], "13:40")
 
     def test_first_kakao_message_received_time_overrides_text_time(self):
         parsed = {"사고일시": "2000-01-01 01:01", "선박명": "시험호", "사고위치": "",

@@ -2561,24 +2561,38 @@ def _confirmation_from_first_report(report: str) -> dict:
 
 def _prepare_report_confirmation(utterance: str, first_report: str = "",
                                  existing_confirmed: dict = None) -> dict:
-    """1차 속보 → 기존 사용자 답변 → 원문/API 순으로 채우고, 진짜 누락값만 질문한다."""
-    parsed = _parse_nl(utterance)
+    """1차 속보 → 기존 사용자 답변 → 필요한 경우에만 원문 분석/API 순으로 채운다."""
     candidate = {
-        "사고일시": _accident_iso(parsed.get("사고일시") or utterance),
-        "선박명": str(parsed.get("선박명") or "").strip(),
-        "사고위치": str(parsed.get("사고위치") or "").strip(),
+        "사고일시": "", "선박명": "", "사고위치": "",
         "항로": "", "출항시각": "",
-        "여객": str(parsed.get("여객") or "").strip(),
-        "승무원": str(parsed.get("승무원") or "").strip(),
-        "사고개요": str(parsed.get("사고개요") or "").strip(),
+        "여객": "", "승무원": "", "사고개요": "",
     }
-    # 이미 1차 보고서에 표출된 값이 재파싱 결과보다 우선한다.
+    # 이미 사용자에게 표출된 1차 보고서 값을 먼저 확정 후보로 사용한다.
     candidate.update({k: v for k, v in _confirmation_from_first_report(first_report).items() if v != ""})
     # 사용자가 누락 질문에 직접 답한 값은 가장 높은 우선순위로 보존한다.
     candidate.update({k: str(v).strip() for k, v in (existing_confirmed or {}).items()
                       if str(v).strip() != ""})
 
     pending = _pending_report_keys(candidate)
+
+    # 1차 보고서에 없는 사고 원문 추출 항목이 있을 때만 LLM을 다시 호출한다.
+    # 항로·출항시각만 비어 있으면 아래의 MTIS/선박 조회로 채우므로 재분석하지 않는다.
+    parseable_keys = {"사고일시", "선박명", "사고위치", "여객", "승무원", "사고개요"}
+    if any(key in parseable_keys and not candidate.get(key) for key in pending):
+        parsed = _parse_nl(utterance)
+        parsed_values = {
+            "사고일시": _accident_iso(parsed.get("사고일시") or utterance),
+            "선박명": str(parsed.get("선박명") or "").strip(),
+            "사고위치": str(parsed.get("사고위치") or "").strip(),
+            "여객": str(parsed.get("여객") or "").strip(),
+            "승무원": str(parsed.get("승무원") or "").strip(),
+            "사고개요": str(parsed.get("사고개요") or "").strip(),
+        }
+        for key, value in parsed_values.items():
+            if not candidate.get(key) and value:
+                candidate[key] = value
+        pending = _pending_report_keys(candidate)
+
     if not pending:
         return candidate
 
