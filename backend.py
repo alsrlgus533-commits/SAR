@@ -1656,15 +1656,19 @@ def _add_hemisphere(loc: str) -> str:
     return re.sub(r"(\d{1,3}(?:[-–]\d{1,2}(?:\.\d+)?|\.\d+))([NSEWnsew])?", repl, loc)
 
 
-def _build_report_text(utterance: str) -> str:
-    """사고 자유텍스트 → 1차(속보) 보고서 텍스트."""
+def _build_report_text(utterance: str, kakao_received_at: str = "") -> str:
+    """사고 자유텍스트 → 1차(속보) 보고서 텍스트.
+
+    카카오 경로는 첫 사고 메시지 수신시각을 넘겨 신고문 속 시각보다 우선한다.
+    """
     parsed = _parse_nl(utterance)
     ship = str(parsed.get("선박명") or "").strip()
     loc = str(parsed.get("사고위치") or "").strip()
     pax = str(parsed.get("여객") or "").strip()
     crew = str(parsed.get("승무원") or "").strip()
     summary = str(parsed.get("사고개요") or "").strip()
-    accident_dt = _extract_accident_datetime(parsed.get("사고일시") or utterance)
+    accident_dt = (_extract_accident_datetime(kakao_received_at)
+                   or _extract_accident_datetime(parsed.get("사고일시") or utterance))
 
     lat, lon = _extract_latlon(loc)
 
@@ -1876,13 +1880,14 @@ def _post_callback(callback_url: str, payload: dict):
         print(f"[kakao] 콜백 전송 실패: {exc}", flush=True)
 
 
-def _kakao_callback(callback_url: str, utterance: str, uid: str = "anon", prefix: str = ""):
+def _kakao_callback(callback_url: str, utterance: str, uid: str = "anon", prefix: str = "",
+                    accident_at: str = ""):
     """백그라운드: 보고서 작성 후 카카오 콜백 URL로 결과 전송. prefix는 복구 안내 등 1회성 머리말."""
     try:
-        text = _build_report_text(utterance)
+        text = _build_report_text(utterance, accident_at)
     except Exception as exc:
         text = f"보고서 자동작성 중 오류가 발생했습니다: {exc}"
-    _session_set(uid, report=text, utterance=utterance, mode=None,
+    _session_set(uid, report=text, utterance=utterance, accident_at=accident_at, mode=None,
                  confirmed=None, pending_fields=[])  # 새 사고는 이전 확정값을 폐기
     _post_callback(callback_url, _kakao_report((prefix + text) if prefix else text))
 
@@ -1906,6 +1911,7 @@ def kakao_skill():
     callback_url = ureq.get("callbackUrl")
     uid = ((ureq.get("user") or {}).get("id")) or "anon"
     sess = _SESSIONS.get(uid) or {}
+    kakao_received_at = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M")
     print(f"[kakao] 요청 수신 utterance={utterance!r} callbackUrl={'있음' if callback_url else '없음(콜백 미전달)'}", flush=True)
     if not utterance:
         return jsonify(_kakao_text(
@@ -2032,9 +2038,10 @@ def kakao_skill():
 
     # ④-a 콜백(비동기) 처리
     if callback_url:
-        _session_set(uid, mode=None, confirmed=None, pending_fields=[])
+        _session_set(uid, accident_at=kakao_received_at, mode=None,
+                     confirmed=None, pending_fields=[])
         threading.Thread(target=_kakao_callback,
-                         args=(callback_url, utterance, uid, prefix), daemon=True).start()
+                         args=(callback_url, utterance, uid, prefix, kakao_received_at), daemon=True).start()
         return jsonify({
             "version": "2.0",
             "useCallback": True,
@@ -2042,8 +2049,8 @@ def kakao_skill():
         })
     # ④-b 콜백 미설정 폴백: 동기 처리(외부 API 지연 시 5초 초과 가능)
     try:
-        text = _build_report_text(utterance)
-        _session_set(uid, report=text, utterance=utterance, mode=None,
+        text = _build_report_text(utterance, kakao_received_at)
+        _session_set(uid, report=text, utterance=utterance, accident_at=kakao_received_at, mode=None,
                      confirmed=None, pending_fields=[])
         return jsonify(_kakao_report(prefix + text if prefix else text))
     except Exception as exc:

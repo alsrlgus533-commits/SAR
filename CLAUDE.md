@@ -91,6 +91,7 @@
 ## 카카오톡 챗봇 (카카오 i 오픈빌더 스킬 서버)
 
 - 백엔드 엔드포인트: `POST /kakao` — 카카오 i 오픈빌더 **스킬 서버(웹훅)**. 사고 자유텍스트 → 1차 속보 자동 작성
+- **사고 발생 시각은 첫 사고 카카오 메시지를 서버가 수신한 KST 시각으로 고정**한다. 신고문에 별도 시각이 있어도 카카오 경로에서는 수신시각이 우선하며, 이 값이 1차 속보 `▶ 발생`과 정식 보고서에 그대로 이어진다(버튼·보완답변 시각으로 덮어쓰지 않음).
 - **콜백(비동기) 방식**: 카카오 5초 제한을 넘기므로 즉시 `{"version":"2.0","useCallback":true,...}`(접수 안내) 응답 후, 백그라운드 스레드가 보고서를 작성해 `userRequest.callbackUrl`로 최종 결과를 POST(`_kakao_callback`). 오픈빌더 블록에서 **콜백 사용 ON** 필요
 - 오케스트레이션은 서버에서 수행: `_parse_nl`(LLM→규칙 폴백 `_rule_parse`) → `_vessel_lookup` · `_route_lookup` · `_weather_lookup`(AWS 포함) → `_build_report_text`로 simpleText 조립
   - 좌표는 `_extract_latlon`/`_parse_coord`(프론트 `extractLatLon`의 서버 포팅본)로 사고위치에서 추출

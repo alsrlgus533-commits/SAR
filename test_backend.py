@@ -114,6 +114,38 @@ class ReportConfirmationTests(unittest.TestCase):
         vessel_lookup.assert_not_called()
         route_lookup.assert_not_called()
 
+    def test_first_kakao_message_received_time_overrides_text_time(self):
+        parsed = {"사고일시": "2000-01-01 01:01", "선박명": "시험호", "사고위치": "",
+                  "여객": "1", "승무원": "1", "사고개요": "기관 고장"}
+        with patch.object(backend, "_parse_nl", return_value=parsed), \
+             patch.object(backend, "_vessel_lookup", return_value=None), \
+             patch.object(backend, "_route_lookup", return_value=None), \
+             patch.object(backend, "_vms_position_safe", return_value=None), \
+             patch.object(backend, "_weather_lookup", return_value={"error": "test"}), \
+             patch.object(backend, "_pax_lookup", return_value=None):
+            report = backend._build_report_text("2000년 사고", "2026-07-13 15:42")
+        self.assertIn("▶ 발생: 2026-07-13 15:42", report)
+        self.assertNotIn("▶ 발생: 2000-01-01 01:01", report)
+
+    def test_new_kakao_accident_captures_received_time_before_callback(self):
+        uid = "received-time-test"
+        backend._SESSIONS.pop(uid, None)
+        try:
+            with patch.object(backend, "_health_down_critical", return_value=[]), \
+                 patch.object(backend.threading, "Thread") as thread_cls:
+                response = backend.app.test_client().post("/kakao", json={
+                    "userRequest": {
+                        "utterance": "시험호 기관 고장", "callbackUrl": "https://callback.invalid/test",
+                        "user": {"id": uid},
+                    }
+                })
+            self.assertTrue(response.get_json()["useCallback"])
+            callback_args = thread_cls.call_args.kwargs["args"]
+            self.assertRegex(callback_args[4], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$")
+            self.assertEqual(backend._SESSIONS[uid]["accident_at"], callback_args[4])
+        finally:
+            backend._SESSIONS.pop(uid, None)
+
     def test_narrative_rejects_missing_information_instead_of_omitting_it(self):
         with self.assertRaisesRegex(ValueError, "운항 항로"):
             backend._summary_narrative({
