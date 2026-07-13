@@ -913,7 +913,8 @@ _pax_load()
 PARSE_PROMPT = (
     "다음은 여객선 해양사고 보고자의 자유 입력입니다. "
     "핵심 정보를 추출해 JSON으로만 응답하세요. 마크다운·설명 없이 순수 JSON만 출력합니다.\n"
-    "키: 선박명(\"호\"까지 포함), 사고위치(좌표·지명 포함), 여객(숫자만), 승무원(숫자만), 사고개요(한 문장).\n"
+    "키: 사고일시(YYYY-MM-DD HH:MM, 모르면 빈문자열), 선박명(\"호\"까지 포함), "
+    "사고위치(좌표·지명 포함), 여객(숫자만), 승무원(숫자만), 사고개요(한 문장).\n"
     "값을 알 수 없으면 \"\".\n\n입력: "
 )
 
@@ -1042,6 +1043,52 @@ def parse_text():
 
 # ── 자연어 파싱(서버측) — LLM 시도 후 규칙 기반 폴백 ──────────
 
+
+def _extract_accident_datetime(text: str, now: datetime = None):
+    """신고문/확정값에서 실제 사고 일시를 KST datetime으로 추출한다.
+
+    연도가 없으면 현재 연도, 날짜가 없고 시각만 있으면 사고 당일을 오늘로 두되
+    최종 보고서 생성 전 검토 화면에서 사용자가 반드시 확인·수정한다.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    kst = timezone(timedelta(hours=9))
+    base = now.astimezone(kst) if now else datetime.now(kst)
+
+    # 웹 datetime-local 및 LLM 표준 출력.
+    m = re.search(r"(20\d{2})[-./년]\s*(\d{1,2})[-./월]\s*(\d{1,2})(?:일)?"
+                  r"(?:[T\s]+)(\d{1,2})(?::|시\s*)(\d{1,2})(?:분)?", raw)
+    if m:
+        try:
+            return datetime(*(int(x) for x in m.groups()), tzinfo=kst)
+        except ValueError:
+            return None
+
+    # 연도 없는 한국어/숫자 날짜 + 시각.
+    m = re.search(r"(?<!\d)(\d{1,2})(?:월|[-./])\s*(\d{1,2})(?:일)?"
+                  r"(?:[T\s]+)(\d{1,2})(?::|시\s*)(\d{1,2})(?:분)?", raw)
+    if m:
+        try:
+            month, day, hour, minute = (int(x) for x in m.groups())
+            return datetime(base.year, month, day, hour, minute, tzinfo=kst)
+        except ValueError:
+            return None
+
+    # '오늘/금일/어제 14:20', 또는 신속보고에서 흔한 '14시 20분경/14:20경'.
+    m = re.search(r"(?:(오늘|금일|어제)\s*)?(?<!\d)([01]?\d|2[0-3])(?::|시\s*)([0-5]\d)(?:분)?", raw)
+    if m:
+        day_word, hour, minute = m.groups()
+        day = base - timedelta(days=1) if day_word == "어제" else base
+        return day.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
+    return None
+
+
+def _accident_iso(value: str) -> str:
+    dt = _extract_accident_datetime(value)
+    return dt.strftime("%Y-%m-%dT%H:%M") if dt else ""
+
+
 def _rule_parse(text: str) -> dict:
     """LLM 실패 시 규칙 기반 추출 (프론트 ruleParse의 서버 포팅본)."""
     ship = ""
@@ -1107,7 +1154,10 @@ def _rule_parse(text: str) -> dict:
         clean = re.sub(r"\s+", " ", clean).strip(" ,/")
         summary = clean or text[:60]
     loc = " / ".join(x for x in (pos, area) if x)
-    return {"선박명": ship, "사고위치": loc, "여객": pax, "승무원": crew, "사고개요": summary}
+    accident_dt = _extract_accident_datetime(text)
+    accident_at = accident_dt.strftime("%Y-%m-%d %H:%M") if accident_dt else ""
+    return {"사고일시": accident_at, "선박명": ship, "사고위치": loc,
+            "여객": pax, "승무원": crew, "사고개요": summary}
 
 
 def _parse_nl(text: str) -> dict:
@@ -1614,6 +1664,7 @@ def _build_report_text(utterance: str) -> str:
     pax = str(parsed.get("여객") or "").strip()
     crew = str(parsed.get("승무원") or "").strip()
     summary = str(parsed.get("사고개요") or "").strip()
+    accident_dt = _extract_accident_datetime(parsed.get("사고일시") or utterance)
 
     lat, lon = _extract_latlon(loc)
 
@@ -1651,7 +1702,7 @@ def _build_report_text(utterance: str) -> str:
         wx = None
 
     kst = timezone(timedelta(hours=9))
-    now = datetime.now(kst).strftime("%Y-%m-%d %H:%M")
+    occurred = accident_dt.strftime("%Y-%m-%d %H:%M") if accident_dt else "확인 필요"
 
     # 기상 줄 (위치 바로 아래에 배치) — 가장 가까운 1개로 통합 (파고·수온은 부이, 기온은 인근 AWS)
     if wx:
@@ -1681,7 +1732,7 @@ def _build_report_text(utterance: str) -> str:
         L.append(f"▶ 선박: {ship}" + (f" ({spec})" if spec else ""))
     elif ship:
         L.append(f"▶ 선박: {ship}")
-    L.append(f"▶ 발생: {now}")
+    L.append(f"▶ 발생: {occurred}")
 
     # 출항시각 + 항로(출발-도착) — MTIS 점검표 우선(실제 항차), 없으면 운항항로 조회
     dep = str((mtis or {}).get("출항시간") or (route_info or {}).get("출발시각") or "").strip()
@@ -1831,7 +1882,8 @@ def _kakao_callback(callback_url: str, utterance: str, uid: str = "anon", prefix
         text = _build_report_text(utterance)
     except Exception as exc:
         text = f"보고서 자동작성 중 오류가 발생했습니다: {exc}"
-    _session_set(uid, report=text, utterance=utterance, mode=None)  # 저장은 prefix 제외(수정 시 오염 방지)
+    _session_set(uid, report=text, utterance=utterance, mode=None,
+                 confirmed=None, pending_fields=[])  # 새 사고는 이전 확정값을 폐기
     _post_callback(callback_url, _kakao_report((prefix + text) if prefix else text))
 
 
@@ -1859,6 +1911,33 @@ def kakao_skill():
         return jsonify(_kakao_text(
             "사고 내용을 한 문장으로 입력해 주세요.\n"
             "예) 섬사랑12호 추자도 북동방 2해리, 여객 28명 승무원 4명, 폐그물 감김"))
+
+    # 정식 보고서 필수정보를 한 항목씩 확인하는 대화 모드.
+    if sess.get("mode") == "confirm_report_field" and sess.get("pending_fields"):
+        pending = list(sess["pending_fields"])
+        key = pending[0]
+        value = _normalize_confirm_answer(key, utterance)
+        if not value:
+            return jsonify(_kakao_text("입력 형식을 확인해 주세요.\n" + _kakao_confirm_question(key, len(pending))))
+        confirmed = dict(sess.get("confirmed") or {})
+        confirmed[key] = value
+        pending = pending[1:]
+        if pending:
+            _session_set(uid, confirmed=confirmed, pending_fields=pending, mode="confirm_report_field")
+            return jsonify(_kakao_text(_kakao_confirm_question(pending[0], len(pending))))
+
+        src_utt = sess.get("utterance") or ""
+        base = _public_base()
+        _session_set(uid, confirmed=confirmed, pending_fields=[], mode=None)
+        if callback_url:
+            threading.Thread(target=_kakao_hwpx_callback,
+                             args=(callback_url, uid, src_utt, base, confirmed), daemon=True).start()
+            return jsonify({"version": "2.0", "useCallback": True,
+                            "data": {"text": "✅ 필수정보 확인 완료. 정식 보고서(hwpx)를 작성 중입니다…"}})
+        try:
+            return jsonify(_kakao_hwpx_message(src_utt, base, confirmed=confirmed))
+        except Exception as exc:
+            return jsonify(_kakao_text(f"정식 보고서(hwpx) 생성 중 오류가 발생했습니다: {exc}"))
 
     # ① [개요/조치사항 수정] — 버튼(키워드만) 또는 "개요 수정 <내용>" 한 줄 모두 처리
     _edit_m = re.match(r"^(개요|조치사항)\s*수정\s*(.*)$", utterance, re.S)
@@ -1901,14 +1980,19 @@ def kakao_skill():
         src_utt = sess.get("utterance")
         if not src_utt:
             return jsonify(_kakao_text("먼저 사고 내용을 입력해 주세요. 1차 보고서를 만든 뒤 정식 보고서(hwpx)를 받을 수 있습니다."))
+        confirmed = sess.get("confirmed") or _prepare_report_confirmation(src_utt)
+        pending = _pending_report_keys(confirmed)
+        if pending:
+            _session_set(uid, confirmed=confirmed, pending_fields=pending, mode="confirm_report_field")
+            return jsonify(_kakao_text(_kakao_confirm_question(pending[0], len(pending))))
         base = _public_base()
         if callback_url:
             threading.Thread(target=_kakao_hwpx_callback,
-                             args=(callback_url, uid, src_utt, base), daemon=True).start()
+                             args=(callback_url, uid, src_utt, base, confirmed), daemon=True).start()
             return jsonify({"version": "2.0", "useCallback": True,
                             "data": {"text": "📄 정식 보고서(hwpx)를 작성 중입니다… 잠시만 기다려 주세요."}})
         try:
-            return jsonify(_kakao_hwpx_message(src_utt, base))
+            return jsonify(_kakao_hwpx_message(src_utt, base, confirmed=confirmed))
         except Exception as exc:
             return jsonify(_kakao_text(f"정식 보고서(hwpx) 생성 중 오류가 발생했습니다: {exc}"))
 
@@ -1945,7 +2029,7 @@ def kakao_skill():
 
     # ④-a 콜백(비동기) 처리
     if callback_url:
-        _session_set(uid, mode=None)
+        _session_set(uid, mode=None, confirmed=None, pending_fields=[])
         threading.Thread(target=_kakao_callback,
                          args=(callback_url, utterance, uid, prefix), daemon=True).start()
         return jsonify({
@@ -1956,7 +2040,8 @@ def kakao_skill():
     # ④-b 콜백 미설정 폴백: 동기 처리(외부 API 지연 시 5초 초과 가능)
     try:
         text = _build_report_text(utterance)
-        _session_set(uid, report=text, utterance=utterance, mode=None)
+        _session_set(uid, report=text, utterance=utterance, mode=None,
+                     confirmed=None, pending_fields=[])
         return jsonify(_kakao_report(prefix + text if prefix else text))
     except Exception as exc:
         return jsonify(_kakao_text(f"보고서 자동작성 중 오류가 발생했습니다: {exc}"))
@@ -2143,7 +2228,7 @@ def _infer_report_fields(utterance: str, ship: str, summary: str, extra: dict) -
 
 
 def _parse_and_infer(utterance: str, extra: dict = None):
-    """1회 LLM 호출로 ① 파싱(선박명·사고위치·여객·승무원·사고개요)과 ② 공폼 추정(사고종류·추정원인·
+    """1회 LLM 호출로 ① 파싱(사고일시·선박명·사고위치·여객·승무원·사고개요)과 ② 공폼 추정(사고종류·추정원인·
     인명/오염/선박 피해·지연시간·조치사항·조치계획)을 동시 수행 → (parsed, inferred) 반환.
     보고서당 LLM 왕복을 2→1회로 줄여 속도·429를 완화. LLM 미설정/실패 시 규칙 파싱+안전 기본값 폴백."""
     extra = extra or {}
@@ -2157,6 +2242,7 @@ def _parse_and_infer(utterance: str, extra: dict = None):
         f"신고 원문: {utterance}\n"
         f"운항관리자 보충 — 경위: {extra.get('경위','')} / 피해: {extra.get('피해','')} / 조치: {extra.get('조치','')}\n\n"
         "출력 형식(JSON):\n{"
+        "\"사고일시\":\"YYYY-MM-DD HH:MM, 모르면 빈문자열\","
         "\"선박명\":\"'호'까지 포함, 모르면 빈문자열\","
         "\"사고위치\":\"좌표·지명 포함, 모르면 빈문자열\","
         "\"여객\":\"숫자만 또는 빈문자열\",\"승무원\":\"숫자만 또는 빈문자열\","
@@ -2179,7 +2265,7 @@ def _parse_and_infer(utterance: str, extra: dict = None):
         return parsed, _infer_fallback(utterance, parsed.get("사고개요", ""))
 
     parsed = {k: str(d.get(k, "") or "").strip()
-              for k in ("선박명", "사고위치", "여객", "승무원", "사고개요")}
+              for k in ("사고일시", "선박명", "사고위치", "여객", "승무원", "사고개요")}
     if not any(parsed.values()):                     # 파싱이 전부 비면 규칙 파싱으로 보강
         parsed = _rule_parse(utterance)
     inferred = _merge_infer(d, _infer_fallback(utterance, parsed.get("사고개요", "")))
@@ -2191,18 +2277,18 @@ def _kr_date(d: datetime) -> str:
 
 
 def _summary_narrative(f: dict) -> str:
-    """공폼 예시 형식의 '사고개요' 한 문장 작성. LLM(Gemini→Claude) 우선, 실패 시 규칙 조립.
+    """확정된 필수정보로 공폼 형식의 '사고개요' 한 문장을 작성한다.
 
     공폼 예시: 2019. 1. 20.(일) 여수-거문 항로를 운항중인 여객선 섬나라2호(승무원 4명, 여객 32명,
-    차량 8대)가 09:20 00항을 출항하여 초도항으로 운항 중 09:25경 00도 북동쪽 0.5마일 지점에서
+    차량 8대)가 09:20 여수항을 출항하여 거문도항으로 운항 중 09:25경 초도항 북동쪽 0.5마일 지점에서
     좌현 주기관 손상 사고 발생
     슬롯: [날짜(요일)] [출발-도착]항로 운항중인 [선종] [선박명]([승선])가 [출항시각] [출발항]항을
           출항하여 [도착항]항으로 운항 중 [사고시각]경 [사고위치] 지점에서 [사고내용] 사고 발생
-    (미확보 항목은 '미상'이 아니라 공폼처럼 ○○·○○항·○○경 자리표시자로 두거나 생략한다)
+    필수정보가 하나라도 없으면 문장을 만들지 않고 호출자가 사용자에게 해당 정보를 요청한다.
     """
     date = (f.get("date") or "").strip()
     vtype = (f.get("vtype") or "여객선").strip()
-    ship = (f.get("ship") or "○○호").strip()
+    ship = (f.get("ship") or "").strip()
     route = (f.get("route") or "").strip()
     manifest = (f.get("manifest") or "").strip()
     dep = (f.get("dep") or "").strip()
@@ -2210,20 +2296,30 @@ def _summary_narrative(f: dict) -> str:
     acc_t = (f.get("acc_time") or "").strip()
     accident = (f.get("summary") or "").strip()
 
-    # 항로 'A-B' → 출발항·도착항 유도(없으면 ○○)
-    dep_port, arr_port = "○○", "○○"
-    if "-" in route:
-        a, b = route.split("-", 1)
-        dep_port, arr_port = (a.strip() or "○○"), (b.strip() or "○○")
-    route_disp = route or "○○-○○"
+    # 항로 'A-B' → 출발항·도착항 유도.
+    dep_port = arr_port = ""
+    route_parts = [x.strip() for x in re.split(r"\s*[-~∼↔]\s*", route) if x.strip()] if route else []
+    if len(route_parts) >= 2:
+        dep_port, arr_port = route_parts[0], route_parts[-1]
+
+    required = {
+        "사고 일시(날짜)": date, "운항 항로": route, "출발항": dep_port, "도착항": arr_port,
+        "선종": vtype, "선박명": ship, "승선인원": manifest, "출항 시각": dep,
+        "사고 시각": acc_t, "사고 위치": spot, "사고 내용": accident,
+    }
+    missing = [label for label, value in required.items() if not str(value).strip()]
+    if missing:
+        raise ValueError("사고개요 필수정보 미확인: " + ", ".join(missing))
+
+    def port_with_suffix(name):
+        return name if not name or name.endswith("항") else name + "항"
 
     def fallback():
-        s = f"{date} {route_disp} 항로를 운항중인 {vtype} {ship}"
-        if manifest:
-            s += f"({manifest})"
-        s += f"가 {dep + ' ' if dep else ''}{dep_port}항을 출항하여 {arr_port}항으로 운항 중 "
-        s += f"{acc_t + '경 ' if acc_t else ''}{spot or '○○ 부근'} 지점에서 "
-        s += f"{accident or '○○'} 사고 발생"
+        s = (f"{date} {route} 항로를 운항중인 {vtype} {ship}({manifest})가 "
+             f"{dep} {port_with_suffix(dep_port)}을 출항하여 {port_with_suffix(arr_port)}으로 운항 중 "
+             f"{acc_t}경 {spot} 지점에서 ")
+        detail = accident
+        s += detail if detail.endswith("발생") else f"{detail} 사고 발생"
         return s
 
     if not (GEMINI_KEY or ANTHROPIC_KEY):
@@ -2232,21 +2328,21 @@ def _summary_narrative(f: dict) -> str:
         "다음 사실로 해양사고 보고서의 '사고개요'를 한국어 한 문장으로 작성하라. "
         "아래 공폼 예시의 문체·구조·어순을 그대로 따른다.\n\n"
         "예시: \"2019. 1. 20.(일) 여수-거문 항로를 운항중인 여객선 섬나라2호(승무원 4명, 여객 32명, "
-        "차량 8대)가 09:20 00항을 출항하여 초도항으로 운항 중 09:25경 00도 북동쪽 0.5마일 지점에서 "
+        "차량 8대)가 09:20 여수항을 출항하여 거문도항으로 운항 중 09:25경 초도항 북동쪽 0.5마일 지점에서 "
         "좌현 주기관 손상 사고 발생\"\n\n"
         "슬롯 순서: [날짜(요일)] [출발-도착]항로를 운항중인 [선종] [선박명]([승선])가 "
         "[출항시각] [출발항]항을 출항하여 [도착항]항으로 운항 중 [사고시각]경 [사고위치] 지점에서 "
         "[사고내용] 사고 발생\n\n"
-        f"사실:\n- 날짜: {date or '○○'}\n- 항로: {route or '○○-○○'}\n"
+        f"사실:\n- 날짜: {date}\n- 항로: {route}\n"
         f"- 출발항: {dep_port}\n- 도착항: {arr_port}\n"
-        f"- 선종: {vtype}\n- 선박: {ship}\n- 승선: {manifest or '(정보없음 → 괄호 생략)'}\n"
-        f"- 출항시각: {dep or '○○'}\n- 사고시각: {acc_t or '○○'}\n"
-        f"- 사고위치: {spot or '○○'}\n- 사고내용: {accident or '○○'}\n\n"
+        f"- 선종: {vtype}\n- 선박: {ship}\n- 승선: {manifest}\n"
+        f"- 출항시각: {dep}\n- 사고시각: {acc_t}\n"
+        f"- 사고위치: {spot}\n- 사고내용: {accident}\n\n"
         "규칙:\n"
         "- 반드시 한 문장, '…사고 발생'으로 끝낸다.\n"
         "- 선종(여객선 등)을 선박명 앞에 반드시 붙인다.\n"
-        "- '미상'이라는 단어는 절대 쓰지 않는다. 모르는 값은 공폼처럼 ○○·○○항·○○경 자리표시자로 두거나 자연스럽게 생략한다.\n"
-        "- 승선 정보가 없으면 괄호를 통째로 생략한다('(승선 미상)' 같은 표기 금지).\n"
+        "- 모든 값은 보고자가 확인한 필수정보이므로 하나도 생략하지 않는다.\n"
+        "- ○○·00·미상·확인 중 같은 자리표시자를 절대 쓰지 않는다.\n"
         "- 사고내용은 신고된 표현(예: '선저 파공')을 그대로 보존한다. 임의로 다른 사고종류로 바꾸거나 의역하지 않는다.\n"
         "- 아는 값은 빠짐없이 넣고 슬롯 순서를 바꾸지 않는다.\n"
         "- 따옴표·설명·접두어 없이 문장만 출력한다."
@@ -2260,16 +2356,138 @@ def _summary_narrative(f: dict) -> str:
         return fallback()
 
 
-def _build_report_data(utterance: str, extra: dict = None, center: str = "") -> dict:
+_REPORT_REQUIRED = {
+    "사고일시": "사고 일시",
+    "선박명": "선박명",
+    "사고위치": "사고 위치",
+    "항로": "운항 항로(출발항-도착항)",
+    "출항시각": "출항 시각",
+    "여객": "여객 수",
+    "승무원": "승무원 수",
+    "사고개요": "사고 개요",
+}
+
+
+def _missing_report_fields(confirmed: dict) -> list:
+    d = confirmed if isinstance(confirmed, dict) else {}
+    missing = [label for key, label in _REPORT_REQUIRED.items()
+               if str(d.get(key, "")).strip() == ""]
+    route = str(d.get("항로", "")).strip()
+    if route and len(re.split(r"\s*[-~∼↔]\s*", route, maxsplit=1)) != 2:
+        missing.append("운항 항로 형식(예: 목포-제주)")
+    if d.get("사고일시") and not _extract_accident_datetime(d.get("사고일시")):
+        missing.append("사고 일시 형식(YYYY-MM-DD HH:MM)")
+    if d.get("출항시각") and not re.fullmatch(r"(?:[01]?\d|2[0-3]):[0-5]\d", str(d["출항시각"]).strip()):
+        missing.append("출항 시각 형식(HH:MM)")
+    return missing
+
+
+def _pending_report_keys(confirmed: dict) -> list:
+    d = confirmed if isinstance(confirmed, dict) else {}
+    pending = [key for key in _REPORT_REQUIRED if str(d.get(key, "")).strip() == ""]
+    route = str(d.get("항로", "")).strip()
+    if route and len(re.split(r"\s*[-~∼↔]\s*", route, maxsplit=1)) != 2 and "항로" not in pending:
+        pending.append("항로")
+    if d.get("사고일시") and not _extract_accident_datetime(d.get("사고일시")) and "사고일시" not in pending:
+        pending.append("사고일시")
+    if d.get("출항시각") and not re.fullmatch(r"(?:[01]?\d|2[0-3]):[0-5]\d", str(d["출항시각"]).strip()) and "출항시각" not in pending:
+        pending.append("출항시각")
+    return pending
+
+
+_KAKAO_FIELD_ASK = {
+    "사고일시": "사고 일시를 알려주세요.\n예) 2026-07-13 14:20",
+    "선박명": "사고 선박명을 '호'까지 알려주세요.\n예) 섬사랑12호",
+    "사고위치": "사고 위치를 좌표 또는 기준점 상대 위치로 알려주세요.\n예) 추자항 북동방 2해리",
+    "항로": "운항 항로를 '출발항-도착항' 형식으로 알려주세요.\n예) 목포-제주",
+    "출항시각": "출항 시각을 알려주세요.\n예) 13:40",
+    "여객": "현재 승선한 여객 수를 숫자로 알려주세요.\n예) 28",
+    "승무원": "현재 승선한 승무원 수를 숫자로 알려주세요.\n예) 4",
+    "사고개요": "확인된 사고 내용을 한 문장으로 알려주세요.\n예) 폐그물이 프로펠러에 감겨 자력 항해 불가",
+}
+
+
+def _kakao_confirm_question(key: str, remaining: int = 1) -> str:
+    return (f"📋 정식 보고서 필수정보 확인 ({remaining}건 남음)\n"
+            f"{_KAKAO_FIELD_ASK.get(key, key + '을(를) 알려주세요.')}\n"
+            "※ 답변한 내용은 정식 보고서의 확정값으로 반영됩니다.")
+
+
+def _normalize_confirm_answer(key: str, answer: str) -> str:
+    value = str(answer or "").strip()
+    if key == "사고일시":
+        return _accident_iso(value)
+    if key == "출항시각":
+        m = re.search(r"(?<!\d)([01]?\d|2[0-3])(?::|시\s*)([0-5]\d)(?:분)?", value)
+        return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}" if m else ""
+    if key in ("여객", "승무원"):
+        m = re.search(r"\d+", value)
+        return m.group(0) if m else ""
+    if key == "항로" and len(re.split(r"\s*[-~∼↔]\s*", value, maxsplit=1)) != 2:
+        return ""
+    return value
+
+
+def _prepare_report_confirmation(utterance: str) -> dict:
+    """카카오 원문과 연계 데이터로 확정 후보를 만들고, 빠진 값만 대화로 질문한다."""
+    parsed = _parse_nl(utterance)
+    ship = str(parsed.get("선박명") or "").strip()
+    vessel = route_info = mtis = None
+    if ship:
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            fv = ex.submit(_vessel_lookup, ship)
+            fr = ex.submit(_route_lookup, ship)
+            try:
+                vessel = fv.result()
+            except Exception:
+                vessel = None
+            try:
+                route_info = fr.result()
+            except Exception:
+                route_info = None
+        cd = (vessel or {}).get("선박코드", "")
+        if cd:
+            try:
+                mtis = _predep_lookup(cd)
+            except Exception:
+                mtis = None
+    route = ((mtis or {}).get("항로") or (route_info or {}).get("운항항로")
+             or (route_info or {}).get("면허항로") or (vessel or {}).get("항로") or "")
+    dep = str((mtis or {}).get("출항시간") or (route_info or {}).get("출발시각") or "").strip()
+    if dep.isdigit():
+        dep = f"{dep.zfill(4)[:2]}:{dep.zfill(4)[2:]}"
+    pax = str((mtis or {}).get("여객") or parsed.get("여객") or "").strip()
+    crew = str((mtis or {}).get("승무원") or parsed.get("승무원") or "").strip()
+    return {
+        "사고일시": _accident_iso(parsed.get("사고일시") or utterance),
+        "선박명": ship,
+        "사고위치": str(parsed.get("사고위치") or "").strip(),
+        "항로": str(route).strip(),
+        "출항시각": dep,
+        "여객": pax,
+        "승무원": crew,
+        "사고개요": str(parsed.get("사고개요") or "").strip(),
+    }
+
+
+def _build_report_data(utterance: str, extra: dict = None, center: str = "", confirmed: dict = None) -> dict:
     """챗봇 입력 → 공폼 보고서용 데이터 dict 구성.
-    우선순위: 회사 선박마스터 > KOMSA/MTIS > LLM 추정 > 공폼 자리표시자."""
+    사용자가 검토한 confirmed가 있으면 모든 자동추출·외부조회 값보다 우선한다."""
     extra = extra or {}
+    confirmed = confirmed if isinstance(confirmed, dict) else {}
+    missing = _missing_report_fields(confirmed)
+    if missing:
+        raise ValueError("정식 보고서 필수정보 미확인: " + ", ".join(missing))
     parsed, inf = _parse_and_infer(utterance, extra)   # 파싱+공폼추정 1회 LLM 호출(2→1)
+    for key in ("사고일시", "선박명", "사고위치", "여객", "승무원", "사고개요"):
+        if key in confirmed:
+            parsed[key] = str(confirmed.get(key, "")).strip()
     ship = str(parsed.get("선박명") or "").strip()
     loc = str(parsed.get("사고위치") or "").strip()
     pax = str(parsed.get("여객") or "").strip()
     crew = str(parsed.get("승무원") or "").strip()
     summary = str(parsed.get("사고개요") or "").strip()
+    accident_dt = _extract_accident_datetime(parsed.get("사고일시") or utterance)
 
     lat, lon = _extract_latlon(loc)
 
@@ -2317,9 +2535,11 @@ def _build_report_data(utterance: str, extra: dict = None, center: str = "") -> 
         weather = "풍향( ), 풍속( ), 파고( ), 시정( )"
 
     # 항로·출항
-    route_nm = ((mtis or {}).get("항로") or (route_info or {}).get("운항항로")
+    route_nm = (str(confirmed.get("항로") or "").strip()
+                or (mtis or {}).get("항로") or (route_info or {}).get("운항항로")
                 or (route_info or {}).get("면허항로") or (vessel or {}).get("항로") or "").strip()
-    dep = str((mtis or {}).get("출항시간") or (route_info or {}).get("출발시각") or "").strip()
+    dep = str(confirmed.get("출항시각") or (mtis or {}).get("출항시간")
+              or (route_info or {}).get("출발시각") or "").strip()
     if dep and dep.isdigit():
         dep = f"{dep.zfill(4)[:2]}:{dep.zfill(4)[2:]}"
 
@@ -2333,8 +2553,8 @@ def _build_report_data(utterance: str, extra: dict = None, center: str = "") -> 
             return str(mtis[field])
         return str(fallback or "")
 
-    crew_n = _pax_pick("승무원", crew)
-    pax_n = _pax_pick("여객", pax)
+    crew_n = crew if "승무원" in confirmed else _pax_pick("승무원", crew)
+    pax_n = pax if "여객" in confirmed else _pax_pick("여객", pax)
     if pax_ovr and pax_ovr.get("차량") is not None:
         veh_n = pax_ovr["차량"]
     else:
@@ -2351,13 +2571,13 @@ def _build_report_data(utterance: str, extra: dict = None, center: str = "") -> 
     relpos = _rel_position(lat, lon)
     spot = relpos or (_add_hemisphere(loc) if loc else "")
     narr = _summary_narrative({
-        "date": _kr_date(now),
+        "date": _kr_date(accident_dt) if accident_dt else "",
         "route": route_nm,
         "vtype": (vessel or {}).get("선종") or "여객선",
         "ship": ship,
         "manifest": ", ".join(mani),
         "dep": dep,
-        "acc_time": now.strftime("%H:%M"),
+        "acc_time": accident_dt.strftime("%H:%M") if accident_dt else "",
         "spot": spot,
         "summary": summary,
     })
@@ -2380,7 +2600,7 @@ def _build_report_data(utterance: str, extra: dict = None, center: str = "") -> 
     if not photo and ship:
         photo = _komsa_vessel_photo(ship)
 
-    ph = "00"  # 공폼 자리표시자(미확보 항목)
+    ph = "[미확인]"
     return {
         "사고종류": inf["사고종류"],
         "기준일시": now.strftime("%Y년 %m월 %d일 %H:%M"),
@@ -2633,15 +2853,19 @@ def _compose_report_hwpx(data: dict) -> bytes:
 @app.post("/report/hwpx")
 def report_hwpx():
     """챗봇 데이터 → 정식 해양사고 보고서(hwpx) 다운로드.
-    body: { utterance, center, extra:{경위,피해,조치} }"""
+    body: { utterance, center, extra:{경위,피해,조치}, confirmed:{검토 확정값} }"""
     body = request.get_json(force=True, silent=True) or {}
     utterance = str(body.get("utterance", "")).strip()
     if not utterance:
         return jsonify({"error": "utterance가 필요합니다"}), 400
     center = str(body.get("center", "")).strip()
     extra = body.get("extra") or {}
+    confirmed = body.get("confirmed") or {}
+    missing = _missing_report_fields(confirmed)
+    if missing:
+        return jsonify({"error": "필수정보를 확인·입력해 주세요.", "missing": missing}), 422
     try:
-        data = _build_report_data(utterance, extra, center)
+        data = _build_report_data(utterance, extra, center, confirmed)
         blob = _compose_report_hwpx(data)
     except ImportError:
         return jsonify({"error": "hwpx 생성 라이브러리(pyhwpxlib)가 없습니다. "
@@ -2710,9 +2934,12 @@ def report_download(token):
     })
 
 
-def _kakao_hwpx_message(utterance: str, base: str, center: str = "") -> dict:
+def _kakao_hwpx_message(utterance: str, base: str, center: str = "", confirmed: dict = None) -> dict:
     """utterance로 hwpx 생성·보관 후, 다운로드 버튼이 달린 카카오 textCard 반환."""
-    data = _build_report_data(utterance, {}, center)
+    missing = _missing_report_fields(confirmed or {})
+    if missing:
+        raise ValueError("필수정보 미확인: " + ", ".join(missing))
+    data = _build_report_data(utterance, {}, center, confirmed)
     blob = _compose_report_hwpx(data)
     kst = timezone(timedelta(hours=9))
     fname = (f"{data.get('선명') or '해양사고'}_해양사고보고서_"
@@ -2731,10 +2958,10 @@ def _kakao_hwpx_message(utterance: str, base: str, center: str = "") -> dict:
     }}
 
 
-def _kakao_hwpx_callback(callback_url: str, uid: str, utterance: str, base: str):
+def _kakao_hwpx_callback(callback_url: str, uid: str, utterance: str, base: str, confirmed: dict):
     """백그라운드: hwpx 생성·보관 후 다운로드 카드 콜백 전송."""
     try:
-        payload = _kakao_hwpx_message(utterance, base)
+        payload = _kakao_hwpx_message(utterance, base, confirmed=confirmed)
     except ImportError:
         payload = _kakao_text("hwpx 생성 라이브러리(pyhwpxlib)가 서버에 설치되지 않았습니다. 관리자에게 문의해 주세요.")
     except Exception as exc:

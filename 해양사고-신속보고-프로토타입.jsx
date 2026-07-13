@@ -429,7 +429,36 @@ function mockWeather() {
   return { 지점: "모의 관측점", 풍향: ["북동", "북서", "남동", "남서"][Math.floor(Math.random() * 4)], 풍속: `${r(6, 14)}m/s`, 파고: `${r(0.8, 2.4, 1)}m`, 수온: `${r(16, 21)}℃` };
 }
 
-const EXAMPLE = "섬사랑12호가 위치 33-58.2N, 126-18.7E 제주 추자도 북동방 약 2해리 해상에서 운항 중 부유물(폐그물)이 프로펠러에 감겨 자력 항해 불가. 여객 28명·승무원 4명 승선.";
+const EXAMPLE = "섬사랑12호가 오늘 14:20경 위치 33-58.2N, 126-18.7E 제주 추자도 북동방 약 2해리 해상에서 운항 중 부유물(폐그물)이 프로펠러에 감겨 자력 항해 불가. 여객 28명·승무원 4명 승선.";
+
+const pad2 = (n) => String(n).padStart(2, "0");
+const localDateTime = (d) => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+
+function extractAccidentDateTime(text) {
+  const raw = String(text || "").trim();
+  if (!raw) return "";
+  let m = raw.match(/(20\d{2})[-./년]\s*(\d{1,2})[-./월]\s*(\d{1,2})(?:일)?(?:[T\s]+)(\d{1,2})(?::|시\s*)(\d{1,2})(?:분)?/);
+  if (m) {
+    const d = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5]);
+    return Number.isNaN(d.getTime()) ? "" : localDateTime(d);
+  }
+  const now = new Date();
+  m = raw.match(/(?<!\d)(\d{1,2})(?:월|[-./])\s*(\d{1,2})(?:일)?(?:[T\s]+)(\d{1,2})(?::|시\s*)(\d{1,2})(?:분)?/);
+  if (m) {
+    const d = new Date(now.getFullYear(), +m[1] - 1, +m[2], +m[3], +m[4]);
+    return Number.isNaN(d.getTime()) ? "" : localDateTime(d);
+  }
+  m = raw.match(/(?:(오늘|금일|어제)\s*)?(?<!\d)([01]?\d|2[0-3])(?::|시\s*)([0-5]\d)(?:분)?/);
+  if (m) {
+    const d = new Date();
+    if (m[1] === "어제") d.setDate(d.getDate() - 1);
+    d.setHours(+m[2], +m[3], 0, 0);
+    return localDateTime(d);
+  }
+  return "";
+}
+
+const normalizeAccidentDateTime = (value, source = "") => extractAccidentDateTime(value) || extractAccidentDateTime(source);
 
 // ── 자연어 파싱(규칙 기반 — Claude API 실패 시 대체) ──
 function ruleParse(text) {
@@ -464,11 +493,11 @@ function ruleParse(text) {
   else if (/추진기|프로펠러|스크류/.test(text)) summary = "추진기 고장으로 자력 항해 불가";
   else if (/기관|엔진/.test(text)) summary = "기관 고장으로 자력 항해 불가";
   else if (/정선|표류/.test(text)) summary = "자력 항해 불가 (정선·표류)";
-  return { 선박명: ship, 사고위치: [pos, area].filter(Boolean).join(" / "), 여객: pax, 승무원: crew, 사고개요: summary || text.slice(0, 60) };
+  return { 사고일시: extractAccidentDateTime(text), 선박명: ship, 사고위치: [pos, area].filter(Boolean).join(" / "), 여객: pax, 승무원: crew, 사고개요: summary || text.slice(0, 60) };
 }
 
 // 파싱 프롬프트(Claude·Gemini 공통)
-const PARSE_INSTRUCTION = (text) => `다음은 여객선 해양사고 보고자의 자유 입력입니다. 핵심 정보를 추출해 JSON으로만 응답하세요. 마크다운·설명 없이 순수 JSON만 출력합니다.\n키: 선박명("호"까지 포함), 사고위치(좌표·지명 포함), 여객(숫자만), 승무원(숫자만), 사고개요(한 문장).\n값을 알 수 없으면 "".\n\n입력: ${text}`;
+const PARSE_INSTRUCTION = (text) => `다음은 여객선 해양사고 보고자의 자유 입력입니다. 핵심 정보를 추출해 JSON으로만 응답하세요. 마크다운·설명 없이 순수 JSON만 출력합니다.\n키: 사고일시(YYYY-MM-DD HH:MM, 모르면 빈문자열), 선박명("호"까지 포함), 사고위치(좌표·지명 포함), 여객(숫자만), 승무원(숫자만), 사고개요(한 문장).\n값을 알 수 없으면 "".\n\n입력: ${text}`;
 
 async function aiParse(text, anthropicKey) {
   if (!anthropicKey) throw new Error("anthropicKey 미설정");
@@ -596,6 +625,12 @@ function parseSeaObs(text) {
 }
 
 const now = () => new Date().toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+const hhmm = (value) => {
+  const s = String(value || "").trim();
+  return /^\d{4}$/.test(s) ? `${s.slice(0, 2)}:${s.slice(2)}` : s;
+};
+const resolvedRoute = (mtis, route, vessel) => String(mtis?.항로 || route?.운항항로 || route?.면허항로 || vessel?.항로 || "").trim();
+const resolvedDeparture = (mtis, route) => hhmm(mtis?.출항시간 || route?.출발시각 || "");
 
 export default function App() {
   const [cfg, setCfg] = useState(() => {
@@ -644,6 +679,29 @@ export default function App() {
   useEffect(() => { if (report && vesselList.length === 0) loadVessels(); }, [report]); // 백엔드를 늦게 켠 경우 자동 복구
   const fmt = (s) => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 
+  const requiredReportFields = [
+    ["사고일시", "사고 일시"], ["선박명", "선박명"], ["사고위치", "사고 위치"],
+    ["운항항로", "운항 항로(출발항-도착항)"], ["출항시각", "출항 시각"],
+    ["여객", "여객 수"], ["승무원", "승무원 수"], ["사고개요", "사고 개요"],
+  ];
+  const missingReportFields = report ? requiredReportFields
+    .filter(([key]) => String(report[key] ?? "").trim() === "")
+    .map(([, label]) => label) : [];
+  if (report?.운항항로 && !/[-~∼↔]/.test(report.운항항로)) missingReportFields.push("운항 항로 형식(예: 목포-제주)");
+
+  const updateReportField = (key, value) => {
+    setReviewed(false);
+    setReport((r) => {
+      const next = { ...r, [key]: value };
+      if (key === "사고일시") next.발생일시 = value;
+      if (key === "여객" || key === "승무원") {
+        const p = parseInt(next.여객, 10); const c = parseInt(next.승무원, 10);
+        next.합계 = (Number.isNaN(p) ? 0 : p) + (Number.isNaN(c) ? 0 : c);
+      }
+      return next;
+    });
+  };
+
   const SRC_BADGE = { live: { txt: "실데이터", bg: "#E6F4EC", bd: "#1B7F4E", fg: "#1B7F4E" }, mock: { txt: "모의(연결 실패)", bg: "#FDECEA", bd: "#C03221", fg: "#C03221" } };
   const Badge = ({ kind }) => kind ? <span style={{ fontSize: 10, fontWeight: 800, padding: "2px 6px", borderRadius: 4, marginLeft: 6, background: SRC_BADGE[kind].bg, border: `1px solid ${SRC_BADGE[kind].bd}`, color: SRC_BADGE[kind].fg }}>{SRC_BADGE[kind].txt}</span> : null;
 
@@ -666,6 +724,7 @@ export default function App() {
       try { parsed = await ai.run(); via = ai.name; break; } catch { /* 다음 후보로 폴백 */ }
     }
     if (!parsed || (!parsed.선박명 && !parsed.사고개요)) { parsed = ruleParse(text); via = "규칙"; }
+    parsed.사고일시 = normalizeAccidentDateTime(parsed.사고일시, text);
     setMsgs((m) => [...m, { who: "bot", text: `입력 내용을 확인했습니다. (${via} 기반 자동 추출) 공공데이터 API를 호출합니다.` }]);
 
     // ── KOMSA 제원 ──
@@ -747,25 +806,65 @@ export default function App() {
       parsed.사고위치 = `${fmtDM(vll.lat, vll.lon)} (실시간 AIS · 수신 ${vpos.수신시각 || "-"})`;
     }
     const total = (parseInt(parsed.여객 || 0) + parseInt(parsed.승무원 || 0)) || "";
-    setReport({ ...parsed, 원문: text, 상대위치, 합계: total, vessel, wx, route, 발생일시: `${new Date().toLocaleDateString("ko-KR")} ${now()}` });
-    setMsgs((m) => [...m, { who: "bot", text: "1차(속보) 보고서 조안을 작성했습니다. 내용 확인 후 [발송] 버튼을 눌러주세요.", action: true }]);
+    const draftReport = {
+      ...parsed,
+      원문: text,
+      상대위치,
+      합계: total,
+      vessel,
+      wx,
+      route,
+      발생일시: parsed.사고일시,
+      운항항로: resolvedRoute(null, route, vessel),
+      출항시각: resolvedDeparture(null, route),
+    };
+    setReport(draftReport);
+    const draftMissing = requiredReportFields
+      .filter(([key]) => String(draftReport[key] ?? "").trim() === "")
+      .map(([, label]) => label);
+    if (draftReport.운항항로 && !/[-~∼↔]/.test(draftReport.운항항로)) draftMissing.push("운항 항로 형식(예: 목포-제주)");
+    setMsgs((m) => [...m, {
+      who: "bot",
+      text: draftMissing.length
+        ? `1차 속보 조안을 작성했습니다. 정식 보고서 생성에 필요한 정보가 부족합니다: ${draftMissing.join(", ")}. ③ 최종 보고의 필수정보 확인란에 입력해 주세요.`
+        : "1차(속보) 보고서 조안을 작성했습니다. 필수정보가 모두 확보되었습니다. 내용 확인 후 [발송] 버튼을 눌러주세요.",
+      action: true,
+    }]);
     setBusy(false);
   }
 
   // ── 정식 해양사고 보고서(hwpx) 생성·다운로드 (backend.py /report/hwpx 경유) ──
   async function downloadHwpx() {
     if (!report || hwpxBusy) return;
+    if (missingReportFields.length) {
+      setMsgs((m) => [...m, { who: "bot", text: `정식 보고서 생성 전 필수정보를 확인해 주세요: ${missingReportFields.join(", ")}` }]);
+      return;
+    }
     setHwpxBusy(true);
     const base = (cfg.proxy || "http://localhost:8000").replace(/\/$/, "");
     try {
       const res = await fetch(`${base}/report/hwpx`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ utterance: report.원문 || "", center, extra }),
+        body: JSON.stringify({
+          utterance: report.원문 || "",
+          center,
+          extra,
+          confirmed: {
+            사고일시: report.사고일시,
+            선박명: report.선박명,
+            사고위치: report.사고위치,
+            항로: report.운항항로,
+            출항시각: report.출항시각,
+            여객: String(report.여객),
+            승무원: String(report.승무원),
+            사고개요: report.사고개요,
+          },
+        }),
       });
       if (!res.ok) {
         let msg = `HTTP ${res.status}`;
-        try { const j = await res.json(); msg = j.error || msg; } catch { /* 비JSON 응답 */ }
+        try { const j = await res.json(); msg = [j.error, ...(j.missing || [])].filter(Boolean).join(" ") || msg; } catch { /* 비JSON 응답 */ }
         throw new Error(msg);
       }
       const blob = await res.blob();
@@ -914,12 +1013,20 @@ export default function App() {
             <div style={S.panelHead}>② 1차(속보) 보고서 자동 작성 → 확인 후 운항상황센터 신속 전파</div>
             <table style={S.table}>
               <tbody>
-                <Row k="발생일시" v={report.발생일시} />
+                <Row k="발생일시" v={report.발생일시 ? report.발생일시.replace("T", " ") : "확인 필요"} />
                 <Row k="선박명" v={<VesselPicker value={report.선박명} vessel={report.vessel} src={src.vessel} list={vesselList}
                   onPick={(x) => { setReport((r) => ({ ...r, 선박명: x.선박명, vessel: x.vessel })); setSrc((s) => ({ ...s, vessel: x.src })); }} />} />
                 <Row k="사고위치" v={<span>{report.사고위치 || "확인 중"}{report.상대위치 && <span style={{ display: "block", fontWeight: 700, color: "#0B2545" }}>※ {report.상대위치} <span style={{ fontSize: 11, color: "#8295AB", fontWeight: 400 }}>(기준점 자동 계산)</span></span>}</span>} />
                 <Row k="승선인원" v={manifestCell(report)} />
-                <Row k="실승선 조회" v={<MtisPredep vessel={report.vessel} cfg={cfg} onFill={(d) => setReport((r) => ({ ...r, 여객: d.여객, 승무원: d.승무원, 합계: (d.여객 || 0) + (d.승무원 || 0), mtis: d }))} />} />
+                <Row k="실승선 조회" v={<MtisPredep vessel={report.vessel} cfg={cfg} onFill={(d) => setReport((r) => ({
+                  ...r,
+                  여객: d.여객,
+                  승무원: d.승무원,
+                  합계: (d.여객 || 0) + (d.승무원 || 0),
+                  mtis: d,
+                  운항항로: resolvedRoute(d, r.route, r.vessel),
+                  출항시각: resolvedDeparture(d, r.route),
+                }))} />} />
                 {report.mtis && <Row k="화물적재" v={cargoCell(report.mtis)} />}
                 <Row k="사고개요" v={report.사고개요} />
                 {(report.route || report.mtis) && <Row k="운항항로" v={<span>{routeCell(report)}{report.mtis ? <span style={{ fontSize: 10, fontWeight: 800, padding: "2px 6px", borderRadius: 4, marginLeft: 6, background: "#E6F4EC", border: "1px solid #1B7F4E", color: "#1B7F4E" }}>MTIS 출항전점검표</span> : <Badge kind={src.route} />}</span>} />}
@@ -952,15 +1059,67 @@ export default function App() {
               <tbody>
                 <Row k="보고구분" v="최종 보고 (규정 서식)" />
                 <Row k="자동 반영" v="1차 입력 정보 + API 연계 데이터(제원·기상) 자동 채움" />
-                <Row k="발생일시" v={report.발생일시} />
+                <Row k="발생일시" v={report.발생일시 ? report.발생일시.replace("T", " ") : "확인 필요"} />
                 <Row k="선박명" v={report.vessel ? `${report.선박명} / ${report.vessel.선종 || "—"} / ${report.vessel.총톤수 || "—"}${report.vessel.선사 ? ` / ${report.vessel.선사}` : ""}` : report.선박명} />
                 <Row k="사고위치" v={<span>{report.사고위치 || "—"}{report.상대위치 && <span style={{ display: "block", fontWeight: 700 }}>※ {report.상대위치}</span>}</span>} />
                 <Row k="승선인원" v={manifestCell(report)} />
                 {report.mtis && <Row k="화물적재" v={cargoCell(report.mtis)} />}
                 <Row k="사고개요" v={report.사고개요} />
-                {(report.route || report.mtis) && <Row k="운항항로" v={routeCell(report)} />}
+                <Row k="운항항로" v={[report.운항항로, report.출항시각 && `출항 ${report.출항시각}`].filter(Boolean).join(" · ") || "확인 필요"} />
               </tbody>
             </table>
+            <div style={{ ...S.reviewBox, borderColor: missingReportFields.length ? "#C03221" : "#1B7F4E", background: missingReportFields.length ? "#FFF5F3" : "#F1FAF5" }}>
+              <div style={{ fontWeight: 800, color: missingReportFields.length ? "#C03221" : "#1B7F4E", marginBottom: 6 }}>
+                {missingReportFields.length
+                  ? `필수정보 ${missingReportFields.length}건을 확인·입력해 주세요.`
+                  : "필수정보가 모두 입력되었습니다. 각 값을 확인한 뒤 보고서를 생성하세요."}
+              </div>
+              {missingReportFields.length > 0 && <div style={{ fontSize: 12, color: "#7A2B20" }}>{missingReportFields.join(" · ")}</div>}
+            </div>
+            <div style={S.formGrid}>
+              <div>
+                <div style={S.formLabel}>사고 일시 *</div>
+                <input type="datetime-local" style={S.textarea} value={report.사고일시 || ""} disabled={!!sentFinal}
+                  onChange={(e) => updateReportField("사고일시", e.target.value)} />
+              </div>
+              <div>
+                <div style={S.formLabel}>선박명 *</div>
+                <input style={S.textarea} value={report.선박명 || ""} disabled={!!sentFinal}
+                  onChange={(e) => updateReportField("선박명", e.target.value)} placeholder="예: 섬사랑12호" />
+              </div>
+              <div>
+                <div style={S.formLabel}>사고 위치 *</div>
+                <input style={S.textarea} value={report.사고위치 || ""} disabled={!!sentFinal}
+                  onChange={(e) => updateReportField("사고위치", e.target.value)} placeholder="좌표 또는 기준점 상대 위치" />
+              </div>
+              <div>
+                <div style={S.formLabel}>운항 항로(출발항-도착항) *</div>
+                <input style={S.textarea} value={report.운항항로 || ""} disabled={!!sentFinal}
+                  onChange={(e) => updateReportField("운항항로", e.target.value)} placeholder="예: 목포-제주" />
+              </div>
+              <div>
+                <div style={S.formLabel}>출항 시각 *</div>
+                <input type="time" style={S.textarea} value={report.출항시각 || ""} disabled={!!sentFinal}
+                  onChange={(e) => updateReportField("출항시각", e.target.value)} />
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                <div>
+                  <div style={S.formLabel}>여객 수 *</div>
+                  <input type="number" min="0" style={S.textarea} value={report.여객 ?? ""} disabled={!!sentFinal}
+                    onChange={(e) => updateReportField("여객", e.target.value)} />
+                </div>
+                <div>
+                  <div style={S.formLabel}>승무원 수 *</div>
+                  <input type="number" min="0" style={S.textarea} value={report.승무원 ?? ""} disabled={!!sentFinal}
+                    onChange={(e) => updateReportField("승무원", e.target.value)} />
+                </div>
+              </div>
+              <div style={{ gridColumn: "1 / -1" }}>
+                <div style={S.formLabel}>사고 개요 *</div>
+                <textarea style={S.textarea} rows={3} value={report.사고개요 || ""} disabled={!!sentFinal}
+                  onChange={(e) => updateReportField("사고개요", e.target.value)} placeholder="확인된 사고 사실만 입력" />
+              </div>
+            </div>
             <div style={S.formGrid}>
               {[["경위", "사고 경위 (추가 기재)"], ["피해", "피해 상황"], ["조치", "후속 조치 계획"]].map(([key, label]) => (
                 <div key={key}>
@@ -975,8 +1134,8 @@ export default function App() {
               <span style={{ ...S.formLabel, marginBottom: 0 }}>보고 센터</span>
               <input style={{ ...S.textarea, width: 220, padding: "8px 10px" }} value={center} disabled={!!sentFinal}
                 onChange={(e) => setCenter(e.target.value)} placeholder="예: 여수운항관리센터" />
-              <button style={{ ...S.primaryBtnLg, background: "#0B5394", padding: "10px 16px", opacity: hwpxBusy ? 0.5 : 1 }}
-                disabled={hwpxBusy} onClick={downloadHwpx}>
+              <button style={{ ...S.primaryBtnLg, background: "#0B5394", padding: "10px 16px", opacity: hwpxBusy || missingReportFields.length ? 0.4 : 1 }}
+                disabled={hwpxBusy || missingReportFields.length > 0} onClick={downloadHwpx}>
                 {hwpxBusy ? "보고서 생성 중…" : "📄 정식 보고서(hwpx) 다운로드"}
               </button>
               <span style={{ fontSize: 12, color: "#5A6B80" }}>공폼 서식 · 회사 선박마스터·기상·제원 자동 반영 · 한글에서 보완</span>
@@ -987,7 +1146,7 @@ export default function App() {
                   <input type="checkbox" checked={reviewed} onChange={(e) => setReviewed(e.target.checked)} />
                   현장 운항관리자가 내용을 검토·확인했습니다
                 </label>
-                <button style={{ ...S.primaryBtnLg, opacity: reviewed ? 1 : 0.4 }} disabled={!reviewed}
+                <button style={{ ...S.primaryBtnLg, opacity: reviewed && !missingReportFields.length ? 1 : 0.4 }} disabled={!reviewed || missingReportFields.length > 0}
                   onClick={() => setSentFinal({ at: now(), t: Date.now() })}>
                   [발송] 본부 정식 보고
                 </button>
@@ -1142,7 +1301,8 @@ const styles = {
   sendArea: { display: "flex", flexDirection: "column", gap: 10, alignItems: "flex-start", marginTop: 6 },
   checkRow: { display: "flex", alignItems: "center", gap: 8, fontSize: 13, fontWeight: 600, color: "#3D5168" },
   sentBanner: { background: "#FFF7E8", border: "1.5px solid #F5A623", borderRadius: 8, padding: "11px 14px", fontSize: 13, fontWeight: 700, color: "#0B2545", marginBottom: 14 },
-  formGrid: { display: "grid", gap: 12, marginBottom: 14 },
+  reviewBox: { border: "1.5px solid", borderRadius: 8, padding: "11px 14px", marginBottom: 14 },
+  formGrid: { display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(240px,1fr))", gap: 12, marginBottom: 14 },
   formLabel: { fontSize: 12, fontWeight: 800, color: "#3D5168", marginBottom: 5 },
   acBox: { position: "absolute", top: "100%", left: 0, right: 0, zIndex: 30, background: "#fff", border: "1px solid #B9C9D9", borderRadius: 8, marginTop: 2, maxHeight: 260, overflowY: "auto", boxShadow: "0 6px 18px rgba(11,37,69,.18)" },
   acItem: { padding: "8px 12px", fontSize: 14, cursor: "pointer", borderBottom: "1px solid #EEF2F6", lineHeight: 1.4 },

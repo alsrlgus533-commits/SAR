@@ -1,0 +1,131 @@
+import os
+import unittest
+from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
+
+os.environ["HEALTH_CHECK"] = "0"
+os.environ["VMS_WARM"] = "0"
+
+import backend
+
+
+class ReportConfirmationTests(unittest.TestCase):
+    def setUp(self):
+        self.gemini = backend.GEMINI_KEY
+        self.anthropic = backend.ANTHROPIC_KEY
+        backend.GEMINI_KEY = ""
+        backend.ANTHROPIC_KEY = ""
+
+    def tearDown(self):
+        backend.GEMINI_KEY = self.gemini
+        backend.ANTHROPIC_KEY = self.anthropic
+
+    def test_extracts_actual_accident_datetime(self):
+        dt = backend._extract_accident_datetime("2026년 7월 13일 14시 20분경 기관 고장")
+        self.assertEqual(dt.strftime("%Y-%m-%d %H:%M"), "2026-07-13 14:20")
+
+        base = datetime(2026, 7, 13, 18, 0, tzinfo=timezone(timedelta(hours=9)))
+        dt = backend._extract_accident_datetime("오늘 09:05경 사고", now=base)
+        self.assertEqual(dt.strftime("%Y-%m-%d %H:%M"), "2026-07-13 09:05")
+
+    def test_missing_fields_and_formats_are_rejected(self):
+        confirmed = {key: "값" for key in backend._REPORT_REQUIRED}
+        confirmed.update({"사고일시": "2026-07-13 14:20", "항로": "목포-제주", "출항시각": "13:40"})
+        self.assertEqual(backend._missing_report_fields(confirmed), [])
+
+        confirmed["사고위치"] = ""
+        confirmed["항로"] = "목포 제주"
+        missing = backend._missing_report_fields(confirmed)
+        self.assertIn("사고 위치", missing)
+        self.assertIn("운항 항로 형식(예: 목포-제주)", missing)
+
+    def test_hwpx_endpoint_rejects_unconfirmed_request(self):
+        client = backend.app.test_client()
+        response = client.post("/report/hwpx", json={"utterance": "시험호 기관 고장"})
+        self.assertEqual(response.status_code, 422)
+        body = response.get_json()
+        self.assertEqual(body["error"], "필수정보를 확인·입력해 주세요.")
+        self.assertIn("사고 일시", body["missing"])
+
+    def test_kakao_asks_for_each_missing_field(self):
+        uid = "confirmation-test-user"
+        backend._SESSIONS[uid] = {
+            "utterance": "시험 원문", "confirmed": {},
+            "pending_fields": ["사고일시", "항로"], "mode": "confirm_report_field",
+        }
+        try:
+            response = backend.app.test_client().post("/kakao", json={
+                "userRequest": {"utterance": "2026-07-13 14:20", "user": {"id": uid}}
+            })
+            self.assertEqual(response.status_code, 200)
+            text = response.get_json()["template"]["outputs"][0]["simpleText"]["text"]
+            self.assertIn("운항 항로", text)
+            self.assertEqual(backend._SESSIONS[uid]["confirmed"]["사고일시"], "2026-07-13T14:20")
+        finally:
+            backend._SESSIONS.pop(uid, None)
+
+    def test_narrative_rejects_missing_information_instead_of_omitting_it(self):
+        with self.assertRaisesRegex(ValueError, "운항 항로"):
+            backend._summary_narrative({
+                "date": "2026. 7. 13.(월)", "vtype": "여객선", "ship": "시험호",
+                "manifest": "", "route": "", "dep": "", "acc_time": "14:20",
+                "spot": "추자항 북동방 2해리", "summary": "기관 고장",
+            })
+
+    def test_confirmed_values_override_reparse_and_external_data(self):
+        inferred = {
+            "사고종류": "기관손상", "추정원인": "확인 중", "인명피해": "없음",
+            "오염피해": "없음", "선박피해": "확인 중", "지연시간": "확인 중",
+            "조치사항": ["확인 중"], "조치계획": ["확인 중"],
+        }
+        confirmed = {
+            "사고일시": "2026-07-13T14:20", "선박명": "확정호",
+            "사고위치": "추자항 북동방 2해리", "항로": "목포-제주",
+            "출항시각": "13:40", "여객": "28", "승무원": "4",
+            "사고개요": "기관 고장으로 자력 항해 불가",
+        }
+        reparsed = ({"사고일시": "", "선박명": "오인식호", "사고위치": "",
+                     "여객": "99", "승무원": "9", "사고개요": "다른 내용"}, inferred)
+        vessel = {"선박코드": "X", "선종": "여객선", "총톤수": "100톤", "선사": "시험선사"}
+        mtis = {"항로": "부산-대마", "출항시간": "0800", "여객": "77", "승무원": "7"}
+
+        with patch.object(backend, "_parse_and_infer", return_value=reparsed), \
+             patch.object(backend, "_vessel_lookup", return_value=vessel), \
+             patch.object(backend, "_route_lookup", return_value={"운항항로": "인천-백령", "출발시각": "0900"}), \
+             patch.object(backend, "_predep_lookup", return_value=mtis), \
+             patch.object(backend, "_vessel_master", return_value={}), \
+             patch.object(backend, "_vms_position_safe", return_value=None), \
+             patch.object(backend, "_weather_lookup", return_value=None), \
+             patch.object(backend, "_pax_lookup", return_value={"여객": 66, "승무원": 6}), \
+             patch.object(backend, "_komsa_vessel_photo", return_value=""), \
+             patch.object(backend, "_rel_position", return_value=""):
+            data = backend._build_report_data("원문", {}, "제주운항관리센터", confirmed)
+
+        self.assertEqual(data["선명"], "확정호")
+        self.assertEqual(data["승무정원"], "4")
+        self.assertIn("목포-제주", data["사고개요"])
+        self.assertIn("2026. 7. 13.", data["사고개요"])
+        self.assertIn("14:20경", data["사고개요"])
+        self.assertIn("여객 28명", data["사고개요"])
+        self.assertNotIn("○○", data["사고개요"])
+
+    def test_confirmed_data_composes_valid_hwpx(self):
+        data = {
+            "사고종류": "기관손상", "기준일시": "2026년 07월 13일 14:30",
+            "보고센터": "제주운항관리센터",
+            "사고개요": "2026. 7. 13.(월) 목포-제주 항로를 운항중인 여객선 시험호가 14:20경 기관 고장 사고 발생",
+            "현지기상": "풍향(북), 풍속(3m/s), 파고(0.5m), 시정(양호)",
+            "선명": "시험호", "총톤수": "100톤", "선종": "여객선", "승무정원": "4",
+            "소유자": "시험선사", "선박번호": "TEST-1", "화물": "없음",
+            "선적항": "제주", "국적": "대한민국", "검사기관": "한국해양교통안전공단",
+            "보험현황": "가입", "사진경로": "", "인명피해": "없음", "오염피해": "없음",
+            "선박피해": "확인 중", "지연시간": "확인 중", "추정원인": "확인 중",
+            "조치사항": ["해경 보고"], "조치계획": ["정밀 점검"], "작성일자": "2026. 7. 13.",
+        }
+        blob = backend._compose_report_hwpx(data)
+        self.assertTrue(blob.startswith(b"PK"))
+        self.assertGreater(len(blob), 1000)
+
+
+if __name__ == "__main__":
+    unittest.main()
