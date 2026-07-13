@@ -1980,17 +1980,19 @@ def kakao_skill():
         src_utt = sess.get("utterance")
         if not src_utt:
             return jsonify(_kakao_text("먼저 사고 내용을 입력해 주세요. 1차 보고서를 만든 뒤 정식 보고서(hwpx)를 받을 수 있습니다."))
+        base = _public_base()
+        if callback_url:
+            # 외부 API로 확정 후보를 준비하는 작업도 수초~수십초 걸릴 수 있으므로
+            # 카카오 5초 제한 밖의 콜백 스레드에서 수행한다.
+            threading.Thread(target=_kakao_prepare_hwpx_callback,
+                             args=(callback_url, uid, src_utt, base, sess.get("confirmed")), daemon=True).start()
+            return jsonify({"version": "2.0", "useCallback": True,
+                            "data": {"text": "📋 정식 보고서 필수정보를 확인 중입니다… 잠시만 기다려 주세요."}})
         confirmed = sess.get("confirmed") or _prepare_report_confirmation(src_utt)
         pending = _pending_report_keys(confirmed)
         if pending:
             _session_set(uid, confirmed=confirmed, pending_fields=pending, mode="confirm_report_field")
             return jsonify(_kakao_text(_kakao_confirm_question(pending[0], len(pending))))
-        base = _public_base()
-        if callback_url:
-            threading.Thread(target=_kakao_hwpx_callback,
-                             args=(callback_url, uid, src_utt, base, confirmed), daemon=True).start()
-            return jsonify({"version": "2.0", "useCallback": True,
-                            "data": {"text": "📄 정식 보고서(hwpx)를 작성 중입니다… 잠시만 기다려 주세요."}})
         try:
             return jsonify(_kakao_hwpx_message(src_utt, base, confirmed=confirmed))
         except Exception as exc:
@@ -2966,6 +2968,30 @@ def _kakao_hwpx_callback(callback_url: str, uid: str, utterance: str, base: str,
         payload = _kakao_text("hwpx 생성 라이브러리(pyhwpxlib)가 서버에 설치되지 않았습니다. 관리자에게 문의해 주세요.")
     except Exception as exc:
         payload = _kakao_text(f"정식 보고서(hwpx) 생성 중 오류가 발생했습니다: {exc}")
+    _post_callback(callback_url, payload)
+
+
+def _kakao_prepare_hwpx_callback(callback_url: str, uid: str, utterance: str,
+                                  base: str, existing_confirmed: dict = None):
+    """정식 보고서 준비도 비동기 처리해 카카오 스킬의 5초 응답 제한을 지킨다.
+
+    누락값이 있으면 다운로드 파일 대신 첫 번째 확인 질문을 콜백으로 보내고,
+    모두 확보됐으면 바로 hwpx 다운로드 카드를 보낸다.
+    """
+    try:
+        confirmed = existing_confirmed or _prepare_report_confirmation(utterance)
+        pending = _pending_report_keys(confirmed)
+        if pending:
+            _session_set(uid, confirmed=confirmed, pending_fields=pending,
+                         mode="confirm_report_field")
+            payload = _kakao_text(_kakao_confirm_question(pending[0], len(pending)))
+        else:
+            _session_set(uid, confirmed=confirmed, pending_fields=[], mode=None)
+            payload = _kakao_hwpx_message(utterance, base, confirmed=confirmed)
+    except ImportError:
+        payload = _kakao_text("hwpx 생성 라이브러리(pyhwpxlib)가 서버에 설치되지 않았습니다. 관리자에게 문의해 주세요.")
+    except Exception as exc:
+        payload = _kakao_text(f"정식 보고서 준비 중 오류가 발생했습니다: {exc}")
     _post_callback(callback_url, payload)
 
 

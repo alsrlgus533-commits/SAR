@@ -64,6 +64,26 @@ class ReportConfirmationTests(unittest.TestCase):
         finally:
             backend._SESSIONS.pop(uid, None)
 
+    def test_kakao_formal_report_preparation_is_immediately_deferred(self):
+        uid = "formal-report-callback-test"
+        backend._SESSIONS[uid] = {"utterance": "시험호 기관 고장", "report": "1차 보고서", "mode": None}
+        try:
+            with patch.object(backend, "_prepare_report_confirmation") as prepare, \
+                 patch.object(backend.threading, "Thread") as thread_cls:
+                response = backend.app.test_client().post("/kakao", json={
+                    "userRequest": {
+                        "utterance": "정식 보고서", "callbackUrl": "https://callback.invalid/test",
+                        "user": {"id": uid},
+                    }
+                })
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(response.get_json()["useCallback"])
+            prepare.assert_not_called()
+            thread_cls.assert_called_once()
+            thread_cls.return_value.start.assert_called_once()
+        finally:
+            backend._SESSIONS.pop(uid, None)
+
     def test_narrative_rejects_missing_information_instead_of_omitting_it(self):
         with self.assertRaisesRegex(ValueError, "운항 항로"):
             backend._summary_narrative({
