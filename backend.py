@@ -1908,7 +1908,8 @@ def _kakao_callback(callback_url: str, utterance: str, uid: str = "anon", prefix
     except Exception as exc:
         text = f"보고서 자동작성 중 오류가 발생했습니다: {exc}"
     _session_set(uid, report=text, utterance=utterance, accident_at=accident_at, mode=None,
-                 confirmed=None, pending_fields=[], report_kind=None)  # 새 사고는 이전 확정값을 폐기
+                 confirmed=None, pending_fields=[], report_kind=None,
+                 debris_confirmed=None, pending_debris_fields=[])  # 새 사고는 이전 확정값을 폐기
     _post_callback(callback_url, _kakao_report((prefix + text) if prefix else text))
 
 
@@ -1938,7 +1939,41 @@ def kakao_skill():
             "사고 내용을 한 문장으로 입력해 주세요.\n"
             "예) 섬사랑12호 추자도 북동방 2해리, 여객 28명 승무원 4명, 폐그물 감김"))
 
-    # 정식/부유물 제거 보고서 필수정보를 한 항목씩 확인하는 대화 모드.
+    # 부유물 제거 보고서 전용정보(유입부위→제거방법→완료시각→운항상태) 확인 모드.
+    if sess.get("mode") == "confirm_debris_field" and sess.get("pending_debris_fields"):
+        pending = list(sess["pending_debris_fields"])
+        key = pending[0]
+        value = _normalize_debris_answer(key, utterance)
+        if not value:
+            return jsonify(_kakao_text("입력 형식을 확인해 주세요.\n" + _kakao_debris_question(key, len(pending))))
+        details = dict(sess.get("debris_confirmed") or {})
+        details[key] = value
+        pending = pending[1:]
+        if pending:
+            _session_set(uid, debris_confirmed=details, pending_debris_fields=pending,
+                         mode="confirm_debris_field", report_kind="debris")
+            return jsonify(_kakao_text(_kakao_debris_question(pending[0], len(pending))))
+
+        src_utt = sess.get("utterance") or ""
+        first_report = sess.get("report") or ""
+        confirmed = dict(sess.get("confirmed") or {})
+        base = _public_base()
+        _session_set(uid, debris_confirmed=details, pending_debris_fields=[],
+                     mode=None, report_kind=None)
+        if callback_url:
+            threading.Thread(target=_kakao_debris_hwpx_callback,
+                             args=(callback_url, uid, src_utt, base, confirmed,
+                                   first_report, details), daemon=True).start()
+            return jsonify({"version": "2.0", "useCallback": True,
+                            "data": {"text": "✅ 제거 완료정보 확인 완료. 부유물 제거 조치사항 보고서(hwpx)를 작성 중입니다…"}})
+        try:
+            return jsonify(_kakao_debris_hwpx_message(
+                src_utt, base, confirmed=confirmed, first_report=first_report,
+                debris_details=details))
+        except Exception as exc:
+            return jsonify(_kakao_text(f"부유물 제거 조치사항 보고서(hwpx) 생성 중 오류가 발생했습니다: {exc}"))
+
+    # 정식/부유물 제거 보고서 공통 필수정보를 한 항목씩 확인하는 대화 모드.
     if sess.get("mode") == "confirm_report_field" and sess.get("pending_fields"):
         pending = list(sess["pending_fields"])
         key = pending[0]
@@ -1955,10 +1990,23 @@ def kakao_skill():
         src_utt = sess.get("utterance") or ""
         base = _public_base()
         report_kind = sess.get("report_kind") or "formal"
+        debris_details = None
+        if report_kind == "debris":
+            debris_details = _prepare_debris_confirmation(
+                src_utt, sess.get("report") or "", sess.get("debris_confirmed"))
+            debris_pending = _pending_debris_keys(debris_details)
+            if debris_pending:
+                _session_set(uid, confirmed=confirmed, pending_fields=[],
+                             debris_confirmed=debris_details,
+                             pending_debris_fields=debris_pending,
+                             mode="confirm_debris_field", report_kind="debris")
+                return jsonify(_kakao_text(_kakao_debris_question(
+                    debris_pending[0], len(debris_pending))))
         _session_set(uid, confirmed=confirmed, pending_fields=[], mode=None, report_kind=None)
         if callback_url:
             target = _kakao_debris_hwpx_callback if report_kind == "debris" else _kakao_hwpx_callback
-            args = ((callback_url, uid, src_utt, base, confirmed, sess.get("report") or "")
+            args = ((callback_url, uid, src_utt, base, confirmed, sess.get("report") or "",
+                     debris_details)
                     if report_kind == "debris" else
                     (callback_url, uid, src_utt, base, confirmed))
             threading.Thread(target=target, args=args, daemon=True).start()
@@ -1968,7 +2016,8 @@ def kakao_skill():
         try:
             if report_kind == "debris":
                 return jsonify(_kakao_debris_hwpx_message(
-                    src_utt, base, confirmed=confirmed, first_report=sess.get("report") or ""))
+                    src_utt, base, confirmed=confirmed, first_report=sess.get("report") or "",
+                    debris_details=debris_details))
             return jsonify(_kakao_hwpx_message(src_utt, base, confirmed=confirmed))
         except Exception as exc:
             return jsonify(_kakao_text(f"보고서(hwpx) 생성 중 오류가 발생했습니다: {exc}"))
@@ -2055,9 +2104,20 @@ def kakao_skill():
             _session_set(uid, confirmed=confirmed, pending_fields=pending,
                          mode="confirm_report_field", report_kind="debris")
             return jsonify(_kakao_text(_kakao_confirm_question(pending[0], len(pending))))
+        debris_details = _prepare_debris_confirmation(
+            src_utt, first_report, sess.get("debris_confirmed"))
+        debris_pending = _pending_debris_keys(debris_details)
+        if debris_pending:
+            _session_set(uid, confirmed=confirmed, pending_fields=[],
+                         debris_confirmed=debris_details,
+                         pending_debris_fields=debris_pending,
+                         mode="confirm_debris_field", report_kind="debris")
+            return jsonify(_kakao_text(_kakao_debris_question(
+                debris_pending[0], len(debris_pending))))
         try:
             return jsonify(_kakao_debris_hwpx_message(
-                src_utt, base, confirmed=confirmed, first_report=first_report))
+                src_utt, base, confirmed=confirmed, first_report=first_report,
+                debris_details=debris_details))
         except Exception as exc:
             return jsonify(_kakao_text(f"부유물 제거 조치사항 보고서(hwpx) 생성 중 오류가 발생했습니다: {exc}"))
 
@@ -2095,7 +2155,8 @@ def kakao_skill():
     # ④-a 콜백(비동기) 처리
     if callback_url:
         _session_set(uid, accident_at=kakao_received_at, mode=None,
-                     confirmed=None, pending_fields=[], report_kind=None)
+                     confirmed=None, pending_fields=[], report_kind=None,
+                     debris_confirmed=None, pending_debris_fields=[])
         threading.Thread(target=_kakao_callback,
                          args=(callback_url, utterance, uid, prefix, kakao_received_at), daemon=True).start()
         return jsonify({
@@ -2107,7 +2168,8 @@ def kakao_skill():
     try:
         text = _build_report_text(utterance, kakao_received_at)
         _session_set(uid, report=text, utterance=utterance, accident_at=kakao_received_at, mode=None,
-                     confirmed=None, pending_fields=[], report_kind=None)
+                     confirmed=None, pending_fields=[], report_kind=None,
+                     debris_confirmed=None, pending_debris_fields=[])
         return jsonify(_kakao_report(prefix + text if prefix else text))
     except Exception as exc:
         return jsonify(_kakao_text(f"보고서 자동작성 중 오류가 발생했습니다: {exc}"))
@@ -2543,11 +2605,34 @@ _KAKAO_FIELD_ASK = {
     "사고개요": "확인된 사고 내용을 한 문장으로 알려주세요.\n예) 폐그물이 프로펠러에 감겨 자력 항해 불가",
 }
 
+_DEBRIS_REQUIRED = {
+    "유입상황": "감김·유입 부위와 상태",
+    "제거조치": "부유물 제거 방법",
+    "제거완료시각": "제거 완료 시각",
+    "운항상태": "제거 후 운항 상태",
+}
+
+_KAKAO_DEBRIS_ASK = {
+    "유입상황": ("부유물이 감기거나 이물질이 유입된 정확한 부위와 상태를 알려주세요.\n"
+                 "예) 우현 외측 4번 추진기에 이물질 유입"),
+    "제거조치": ("부유물·이물질을 어떤 방법으로 제거했는지 알려주세요.\n"
+                 "예) 기관 후진하여 이물질 제거"),
+    "제거완료시각": "부유물 제거가 완료된 시각을 알려주세요.\n예) 15:37",
+    "운항상태": ("제거 완료 후 현재 운항 상태를 알려주세요.\n"
+                 "예) 정상운항 재개 / 제거 완료 후 정밀점검 중"),
+}
+
 
 def _kakao_confirm_question(key: str, remaining: int = 1) -> str:
     return (f"📋 정식 보고서 필수정보 확인 ({remaining}건 남음)\n"
             f"{_KAKAO_FIELD_ASK.get(key, key + '을(를) 알려주세요.')}\n"
             "※ 답변한 내용은 정식 보고서의 확정값으로 반영됩니다.")
+
+
+def _kakao_debris_question(key: str, remaining: int = 1) -> str:
+    return (f"🧹 부유물 제거 조치사항 확인 ({remaining}건 남음)\n"
+            f"{_KAKAO_DEBRIS_ASK.get(key, key + '을(를) 알려주세요.')}\n"
+            "※ 제거 완료 내용까지 확인한 후 보고서를 작성합니다.")
 
 
 def _normalize_confirm_answer(key: str, answer: str) -> str:
@@ -2563,6 +2648,59 @@ def _normalize_confirm_answer(key: str, answer: str) -> str:
     if key == "항로" and len(re.split(r"\s*[-~∼↔]\s*", value, maxsplit=1)) != 2:
         return ""
     return value
+
+
+def _normalize_debris_answer(key: str, answer: str) -> str:
+    value = str(answer or "").strip()
+    if key == "제거완료시각":
+        m = re.search(r"(?<!\d)([01]?\d|2[0-3])(?::|시\s*)([0-5]\d)(?:분)?", value)
+        return f"{int(m.group(1)):02d}:{m.group(2)}" if m else ""
+    return value
+
+
+def _debris_confirmation_from_text(*texts: str) -> dict:
+    """원문에 이미 명시된 제거 세부정보만 복원한다. 추정값은 만들지 않는다."""
+    text = " ".join(str(x or "") for x in texts)
+    out = {}
+    incident_patterns = (
+        r"((?:좌현|우현)?\s*(?:내측|외측)?\s*\d*번?\s*(?:추진기|프로펠러|스크류|워터제트)[^,.\n]{0,25}?(?:이물질|부유물|폐그물|폐로프)[^,.\n]{0,15}?(?:유입|감김|감겨))",
+        r"((?:이물질|부유물|폐그물|폐로프)[^,.\n]{0,20}?(?:추진기|프로펠러|스크류|워터제트)[^,.\n]{0,15}?(?:유입|감김|감겨))",
+    )
+    for pattern in incident_patterns:
+        m = re.search(pattern, text, re.I)
+        if m:
+            out["유입상황"] = m.group(1).strip()
+            break
+    action = re.search(r"((?:기관\s*후진|잠수부\s*투입|수중\s*작업|자체\s*작업|인력\s*투입)[^,.\n]{0,40}?(?:이물질|부유물|폐그물|폐로프)?\s*제거)", text, re.I)
+    if action:
+        out["제거조치"] = action.group(1).strip()
+    tm = re.search(r"(?<!\d)([01]?\d|2[0-3])(?::|시\s*)([0-5]\d)(?:분)?(?:경)?[^,.\n]{0,18}?(?:제거\s*(?:완료)?|정상\s*운항\s*재개)", text)
+    if not tm:
+        tm = re.search(r"(?:제거\s*(?:완료)?|정상\s*운항\s*재개)[^,.\n]{0,18}?(?<!\d)([01]?\d|2[0-3])(?::|시\s*)([0-5]\d)(?:분)?", text)
+    if tm:
+        out["제거완료시각"] = f"{int(tm.group(1)):02d}:{tm.group(2)}"
+    status = re.search(r"((?:정상\s*운항\s*재개|운항\s*재개|운항\s*미재개|정밀\s*점검\s*중|운항\s*중단)[^,.\n]{0,20})", text)
+    if status:
+        out["운항상태"] = status.group(1).strip()
+    return out
+
+
+def _prepare_debris_confirmation(utterance: str, first_report: str = "",
+                                 existing: dict = None) -> dict:
+    details = {key: "" for key in _DEBRIS_REQUIRED}
+    details.update(_debris_confirmation_from_text(utterance, first_report))
+    details.update({key: str(value).strip() for key, value in (existing or {}).items()
+                    if key in _DEBRIS_REQUIRED and str(value).strip()})
+    return details
+
+
+def _pending_debris_keys(details: dict) -> list:
+    d = details if isinstance(details, dict) else {}
+    pending = [key for key in _DEBRIS_REQUIRED if not str(d.get(key, "")).strip()]
+    if d.get("제거완료시각") and not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", str(d["제거완료시각"]).strip()):
+        if "제거완료시각" not in pending:
+            pending.append("제거완료시각")
+    return pending
 
 
 def _confirmation_from_first_report(report: str) -> dict:
@@ -2787,6 +2925,9 @@ def _build_report_data(utterance: str, extra: dict = None, center: str = "", con
 
     crew_n = crew if "승무원" in confirmed else _pax_pick("승무원", crew)
     pax_n = pax if "여객" in confirmed else _pax_pick("여객", pax)
+    adult_n = _pax_pick("대인", "")
+    child_n = _pax_pick("소인", "")
+    infant_n = _pax_pick("유아", "")
     if pax_ovr and pax_ovr.get("차량") is not None:
         veh_n = pax_ovr["차량"]
     else:
@@ -2846,6 +2987,9 @@ def _build_report_data(utterance: str, extra: dict = None, center: str = "", con
         "항로": route_nm,
         "출항시각": dep,
         "여객": pax_n,
+        "대인": adult_n,
+        "소인": child_n,
+        "유아": infant_n,
         "차량": str(veh_n or ""),
         "현지기상": weather,
         "선명": ship or ph,
@@ -2869,6 +3013,84 @@ def _build_report_data(utterance: str, extra: dict = None, center: str = "", con
         "조치계획": inf["조치계획"],
         "작성일자": f"{now.year}. {now.month}. {now.day}.",
     }
+
+
+def _debris_summary_narrative(data: dict, details: dict) -> str:
+    """확정된 운항정보와 제거 세부정보로 참고 서식형 개요 문장을 조립한다."""
+    pending = _pending_debris_keys(details)
+    if pending:
+        raise ValueError("부유물 제거정보 미확인: " + ", ".join(_DEBRIS_REQUIRED[key] for key in pending))
+    dt = _extract_accident_datetime(data.get("사고일시"))
+    if not dt:
+        raise ValueError("부유물 제거 보고서 사고 일시 미확인")
+    route = str(data.get("항로") or "").strip()
+    route_parts = [x.strip() for x in re.split(r"\s*[-~∼↔]\s*", route) if x.strip()]
+    if len(route_parts) < 2:
+        raise ValueError("부유물 제거 보고서 운항 항로 미확인")
+
+    def port(name: str) -> str:
+        return name if name.endswith("항") else name + "항"
+
+    def number(value) -> int:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return 0
+
+    manifest = []
+    if data.get("승무정원"):
+        manifest.append(f"선원 {data['승무정원']}명")
+    adult = number(data.get("대인"))
+    children = number(data.get("소인")) + number(data.get("유아"))
+    if adult or children:
+        if adult:
+            manifest.append(f"대인 {adult}명")
+        if children:
+            manifest.append(f"소아 {children}명")
+    elif data.get("여객"):
+        manifest.append(f"여객 {data['여객']}명")
+    if data.get("차량"):
+        manifest.append(f"차량 {data['차량']}대")
+
+    incident = str(details["유입상황"]).strip().rstrip(". ")
+    if re.search(r"(?:되어|하여|발생하여)$", incident):
+        incident_clause = incident
+    elif incident.endswith("유입"):
+        incident_clause = incident + "되어"
+    elif incident.endswith("감겨"):
+        incident_clause = incident
+    elif incident.endswith("감김"):
+        incident_clause = incident + "이 발생하여"
+    else:
+        incident_clause = incident + " 상황이 발생하여"
+
+    action = str(details["제거조치"]).strip().rstrip(". ")
+    action = re.sub(r"\s*후$", "", action)
+    status = str(details["운항상태"]).strip().rstrip(". ")
+    if status.endswith(("함", "임")):
+        status_clause = status
+    elif status.endswith(("재개", "완료")):
+        status_clause = status + "함"
+    elif status.endswith("중"):
+        status_clause = status + "임"
+    else:
+        status_clause = status
+
+    date = f"{dt.month}. {dt.day}.({'월화수목금토일'[dt.weekday()]})"
+    return (f"{date} {data.get('출항시각')} {port(route_parts[0])}을 출항하여 "
+            f"{port(route_parts[-1])}으로 향하던 {data.get('선명')}({route}, {', '.join(manifest)})가 "
+            f"{dt.strftime('%H:%M')}경 {data.get('사고위치')}에서 {incident_clause} "
+            f"{action} 후 {details['제거완료시각']}경 {status_clause}.")
+
+
+def _apply_debris_details(data: dict, details: dict) -> dict:
+    data["사고개요"] = _debris_summary_narrative(data, details)
+    completed = str(details["제거완료시각"])
+    data["조치사항"] = [
+        f"{completed} {str(details['제거조치']).strip()}",
+        f"{completed} {str(details['운항상태']).strip()}",
+    ]
+    return data
 
 
 def _img_size(path: str):
@@ -3121,7 +3343,7 @@ def _compose_debris_report_hwpx(data: dict) -> bytes:
     b.add_table([[data.get("사고개요") or "[미확인]"]], header_bg="",
                 cell_colors={(0, 0): "#FFFFFF"}, cell_aligns={(0, 0): "LEFT"},
                 cell_styles={(0, 0): {"text_color": "#000000", "bold": False}},
-                row_heights=[4200], page_break="NONE")
+                row_heights=[5800], page_break="NONE")
     b.add_paragraph(f"* 사고위치 : {data.get('사고위치') or '[미확인]'}")
     b.add_paragraph(f"** 현지기상 : {data.get('현지기상') or '[미확인]'}")
     b.add_paragraph("")
@@ -3221,8 +3443,14 @@ def report_debris_hwpx():
     missing = _missing_report_fields(confirmed)
     if missing:
         return jsonify({"error": "필수정보를 확인·입력해 주세요.", "missing": missing}), 422
+    debris_details = body.get("debris_details") or {}
+    debris_pending = _pending_debris_keys(debris_details)
+    if debris_pending:
+        return jsonify({"error": "부유물 제거 완료정보를 확인·입력해 주세요.",
+                        "missing": [_DEBRIS_REQUIRED[key] for key in debris_pending]}), 422
     try:
         data = _build_report_data(utterance, extra, center, confirmed)
+        _apply_debris_details(data, debris_details)
         blob = _compose_debris_report_hwpx(data)
     except ImportError:
         return jsonify({"error": "hwpx 생성 라이브러리(pyhwpxlib)가 없습니다. "
@@ -3316,15 +3544,21 @@ def _kakao_hwpx_message(utterance: str, base: str, center: str = "", confirmed: 
 
 
 def _kakao_debris_hwpx_message(utterance: str, base: str, center: str = "",
-                               confirmed: dict = None, first_report: str = "") -> dict:
+                               confirmed: dict = None, first_report: str = "",
+                               debris_details: dict = None) -> dict:
     """부유물 제거 조치사항 HWPX를 생성·보관하고 카카오 다운로드 카드를 반환한다."""
     if not _is_debris_incident(utterance, first_report):
         raise ValueError("부유물 감김·추진기 이물질 유입 사고가 아닙니다")
     missing = _missing_report_fields(confirmed or {})
     if missing:
         raise ValueError("필수정보 미확인: " + ", ".join(missing))
+    debris_pending = _pending_debris_keys(debris_details or {})
+    if debris_pending:
+        raise ValueError("부유물 제거정보 미확인: " + ", ".join(
+            _DEBRIS_REQUIRED[key] for key in debris_pending))
     action = _get_field(first_report, "조치사항")
     data = _build_report_data(utterance, {"조치": action} if action else {}, center, confirmed)
+    _apply_debris_details(data, debris_details)
     blob = _compose_debris_report_hwpx(data)
     kst = timezone(timedelta(hours=9))
     fname = (f"{data.get('선명') or '해양사고'}_부유물제거조치사항_"
@@ -3355,11 +3589,13 @@ def _kakao_hwpx_callback(callback_url: str, uid: str, utterance: str, base: str,
 
 
 def _kakao_debris_hwpx_callback(callback_url: str, uid: str, utterance: str, base: str,
-                                confirmed: dict, first_report: str = ""):
+                                confirmed: dict, first_report: str = "",
+                                debris_details: dict = None):
     """백그라운드: 부유물 제거 조치사항 HWPX 다운로드 카드 콜백 전송."""
     try:
         payload = _kakao_debris_hwpx_message(
-            utterance, base, confirmed=confirmed, first_report=first_report)
+            utterance, base, confirmed=confirmed, first_report=first_report,
+            debris_details=debris_details)
     except ImportError:
         payload = _kakao_text("hwpx 생성 라이브러리(pyhwpxlib)가 서버에 설치되지 않았습니다. 관리자에게 문의해 주세요.")
     except Exception as exc:
@@ -3399,14 +3635,29 @@ def _kakao_prepare_debris_hwpx_callback(callback_url: str, uid: str, utterance: 
     try:
         confirmed = _prepare_report_confirmation(utterance, first_report, existing_confirmed)
         pending = _pending_report_keys(confirmed)
+        debris_details = _prepare_debris_confirmation(utterance, first_report)
         if pending:
             _session_set(uid, confirmed=confirmed, pending_fields=pending,
+                         debris_confirmed=debris_details,
+                         pending_debris_fields=_pending_debris_keys(debris_details),
                          mode="confirm_report_field", report_kind="debris")
             payload = _kakao_text(_kakao_confirm_question(pending[0], len(pending)))
         else:
-            _session_set(uid, confirmed=confirmed, pending_fields=[], mode=None, report_kind=None)
-            payload = _kakao_debris_hwpx_message(
-                utterance, base, confirmed=confirmed, first_report=first_report)
+            debris_pending = _pending_debris_keys(debris_details)
+            if debris_pending:
+                _session_set(uid, confirmed=confirmed, pending_fields=[],
+                             debris_confirmed=debris_details,
+                             pending_debris_fields=debris_pending,
+                             mode="confirm_debris_field", report_kind="debris")
+                payload = _kakao_text(_kakao_debris_question(
+                    debris_pending[0], len(debris_pending)))
+            else:
+                _session_set(uid, confirmed=confirmed, pending_fields=[],
+                             debris_confirmed=debris_details, pending_debris_fields=[],
+                             mode=None, report_kind=None)
+                payload = _kakao_debris_hwpx_message(
+                    utterance, base, confirmed=confirmed, first_report=first_report,
+                    debris_details=debris_details)
     except ImportError:
         payload = _kakao_text("hwpx 생성 라이브러리(pyhwpxlib)가 서버에 설치되지 않았습니다. 관리자에게 문의해 주세요.")
     except Exception as exc:

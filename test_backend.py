@@ -329,6 +329,35 @@ class ReportConfirmationTests(unittest.TestCase):
         self.assertEqual(response.status_code, 422)
         self.assertIn("사고 일시", response.get_json()["missing"])
 
+        confirmed = {key: "값" for key in backend._REPORT_REQUIRED}
+        confirmed.update({"사고일시": "2026-07-14T13:24", "항로": "제주-진도",
+                          "출항시각": "13:20"})
+        response = client.post("/report/debris-hwpx", json={
+            "utterance": "시험호 폐그물 감김", "confirmed": confirmed,
+        })
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("감김·유입 부위와 상태", response.get_json()["missing"])
+
+    def test_debris_summary_covers_entanglement_through_removal_completion(self):
+        data = {
+            "사고일시": "2026-07-11 15:34", "출항시각": "15:30",
+            "항로": "제주-진도", "선명": "산타모니카호",
+            "사고위치": "제주항 방파제 북동쪽 1.5마일 해상",
+            "승무정원": "11", "여객": "142", "대인": "138", "소인": "4", "유아": "0",
+            "차량": "26",
+        }
+        details = {
+            "유입상황": "우현 외측 4번 추진기에 이물질 유입",
+            "제거조치": "기관 후진하여 이물질 제거",
+            "제거완료시각": "15:37", "운항상태": "정상운항 재개",
+        }
+        narrative = backend._debris_summary_narrative(data, details)
+        self.assertTrue(narrative.startswith("7. 11.(토) 15:30 제주항을 출항하여 진도항으로 향하던 산타모니카호"))
+        self.assertIn("선원 11명, 대인 138명, 소아 4명, 차량 26대", narrative)
+        self.assertIn("15:34경 제주항 방파제 북동쪽 1.5마일 해상", narrative)
+        self.assertIn("우현 외측 4번 추진기에 이물질 유입되어", narrative)
+        self.assertIn("기관 후진하여 이물질 제거 후 15:37경 정상운항 재개함.", narrative)
+
     def test_debris_confirmation_finishes_with_debris_template(self):
         uid = "debris-confirmation-finish-test"
         confirmed = {key: "값" for key in backend._REPORT_REQUIRED}
@@ -346,10 +375,21 @@ class ReportConfirmationTests(unittest.TestCase):
                 response = backend.app.test_client().post("/kakao", json={
                     "userRequest": {"utterance": "11", "user": {"id": uid}}
                 })
+                first_question = response.get_json()["template"]["outputs"][0]["simpleText"]["text"]
+                self.assertIn("정확한 부위와 상태", first_question)
+                for answer in ("우현 외측 4번 추진기에 이물질 유입",
+                               "기관 후진하여 이물질 제거", "15:37"):
+                    response = backend.app.test_client().post("/kakao", json={
+                        "userRequest": {"utterance": answer, "user": {"id": uid}}
+                    })
+                response = backend.app.test_client().post("/kakao", json={
+                    "userRequest": {"utterance": "정상운항 재개", "user": {"id": uid}}
+                })
             self.assertEqual(response.get_json(), payload)
             debris.assert_called_once()
             formal.assert_not_called()
             self.assertIsNone(backend._SESSIONS[uid]["report_kind"])
+            self.assertEqual(backend._SESSIONS[uid]["debris_confirmed"]["제거완료시각"], "15:37")
         finally:
             backend._SESSIONS.pop(uid, None)
 

@@ -659,6 +659,9 @@ export default function App() {
   const [center, setCenter] = useState("운항관리센터"); // 보고 센터(정식 보고서 머리글)
   const [hwpxBusy, setHwpxBusy] = useState(false);
   const [selectedReportKind, setSelectedReportKind] = useState("formal");
+  const [debrisDetails, setDebrisDetails] = useState({
+    유입상황: "", 제거조치: "", 제거완료시각: "", 운항상태: "",
+  });
   const chatEnd = useRef(null);
 
   useEffect(() => { try { localStorage.setItem("sar_cfg", JSON.stringify(cfg)); } catch {} }, [cfg]);
@@ -691,6 +694,14 @@ export default function App() {
   if (report?.운항항로 && !/[-~∼↔]/.test(report.운항항로)) missingReportFields.push("운항 항로 형식(예: 목포-제주)");
   const isDebrisIncident = !!report && /부유물|폐그물|폐로프|감김|감겨|이물질.*(?:추진기|프로펠러|스크류)|(?:추진기|프로펠러|스크류).*이물질/i
     .test(`${report.원문 || ""} ${report.사고개요 || ""}`);
+  const debrisFieldLabels = {
+    유입상황: "감김·유입 부위와 상태", 제거조치: "부유물 제거 방법",
+    제거완료시각: "제거 완료 시각", 운항상태: "제거 후 운항 상태",
+  };
+  const missingDebrisFields = selectedReportKind === "debris"
+    ? Object.entries(debrisFieldLabels).filter(([key]) => !String(debrisDetails[key] || "").trim()).map(([, label]) => label)
+    : [];
+  const selectedMissingCount = missingReportFields.length + missingDebrisFields.length;
 
   const updateReportField = (key, value) => {
     setReviewed(false);
@@ -823,6 +834,7 @@ export default function App() {
     };
     setReport(draftReport);
     setSelectedReportKind("formal");
+    setDebrisDetails({ 유입상황: "", 제거조치: "", 제거완료시각: "", 운항상태: "" });
     const draftMissing = requiredReportFields
       .filter(([key]) => String(draftReport[key] ?? "").trim() === "")
       .map(([, label]) => label);
@@ -849,6 +861,10 @@ export default function App() {
       setMsgs((m) => [...m, { who: "bot", text: "부유물 제거 조치사항 보고서는 부유물·폐그물 감김 또는 추진기 이물질 유입 사고에서 선택할 수 있습니다." }]);
       return;
     }
+    if (debris && missingDebrisFields.length) {
+      setMsgs((m) => [...m, { who: "bot", text: `부유물 제거 보고서 생성 전 제거 완료정보를 확인해 주세요: ${missingDebrisFields.join(", ")}` }]);
+      return;
+    }
     setHwpxBusy(true);
     const base = (cfg.proxy || "http://localhost:8000").replace(/\/$/, "");
     try {
@@ -859,6 +875,7 @@ export default function App() {
           utterance: report.원문 || "",
           center,
           extra,
+          debris_details: debrisDetails,
           confirmed: {
             사고일시: report.사고일시,
             선박명: report.선박명,
@@ -1082,6 +1099,36 @@ export default function App() {
                   onClick={() => setSelectedReportKind("debris")}>🧹 부유물 제거 보고서{selectedReportKind === "debris" ? " ✓" : ""}</button>}
               </div>
             </div>
+            {selectedReportKind === "debris" && <div style={{ ...S.reviewBox, borderColor: missingDebrisFields.length ? "#C03221" : "#1B7F4E", background: missingDebrisFields.length ? "#FFF5F3" : "#F1FAF5" }}>
+              <div style={{ fontWeight: 800, color: missingDebrisFields.length ? "#C03221" : "#1B7F4E", marginBottom: 8 }}>
+                부유물 감김·제거 완료정보 {missingDebrisFields.length ? `(${missingDebrisFields.length}건 입력 필요)` : "확인 완료"}
+              </div>
+              <div style={S.formGrid}>
+                <div style={{ gridColumn: "1 / -1" }}>
+                  <div style={S.formLabel}>감김·유입 부위와 상태 *</div>
+                  <input style={S.textarea} value={debrisDetails.유입상황}
+                    onChange={(e) => setDebrisDetails({ ...debrisDetails, 유입상황: e.target.value })}
+                    placeholder="예: 우현 외측 4번 추진기에 이물질 유입" />
+                </div>
+                <div style={{ gridColumn: "1 / -1" }}>
+                  <div style={S.formLabel}>부유물 제거 방법 *</div>
+                  <input style={S.textarea} value={debrisDetails.제거조치}
+                    onChange={(e) => setDebrisDetails({ ...debrisDetails, 제거조치: e.target.value })}
+                    placeholder="예: 기관 후진하여 이물질 제거" />
+                </div>
+                <div>
+                  <div style={S.formLabel}>제거 완료 시각 *</div>
+                  <input type="time" style={S.textarea} value={debrisDetails.제거완료시각}
+                    onChange={(e) => setDebrisDetails({ ...debrisDetails, 제거완료시각: e.target.value })} />
+                </div>
+                <div>
+                  <div style={S.formLabel}>제거 후 운항 상태 *</div>
+                  <input style={S.textarea} value={debrisDetails.운항상태}
+                    onChange={(e) => setDebrisDetails({ ...debrisDetails, 운항상태: e.target.value })}
+                    placeholder="예: 정상운항 재개" />
+                </div>
+              </div>
+            </div>}
             <table style={S.table}>
               <tbody>
                 <Row k="보고구분" v="최종 보고 (규정 서식)" />
@@ -1161,8 +1208,8 @@ export default function App() {
               <span style={{ ...S.formLabel, marginBottom: 0 }}>보고 센터</span>
               <input style={{ ...S.textarea, width: 220, padding: "8px 10px" }} value={center} disabled={!!sentFinal}
                 onChange={(e) => setCenter(e.target.value)} placeholder="예: 여수운항관리센터" />
-              <button style={{ ...S.primaryBtnLg, background: selectedReportKind === "debris" ? "#1B7F4E" : "#0B5394", padding: "10px 16px", opacity: hwpxBusy || missingReportFields.length ? 0.4 : 1 }}
-                disabled={hwpxBusy || missingReportFields.length > 0}
+              <button style={{ ...S.primaryBtnLg, background: selectedReportKind === "debris" ? "#1B7F4E" : "#0B5394", padding: "10px 16px", opacity: hwpxBusy || selectedMissingCount ? 0.4 : 1 }}
+                disabled={hwpxBusy || selectedMissingCount > 0}
                 onClick={selectedReportKind === "debris" ? downloadDebrisHwpx : downloadHwpx}>
                 {hwpxBusy ? "보고서 생성 중…" : selectedReportKind === "debris"
                   ? "🧹 부유물 제거 조치사항(hwpx) 다운로드"
