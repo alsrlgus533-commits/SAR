@@ -1,6 +1,8 @@
+import io
 import os
 import re
 import unittest
+import zipfile
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -269,6 +271,87 @@ class ReportConfirmationTests(unittest.TestCase):
         blob = backend._compose_report_hwpx(data)
         self.assertTrue(blob.startswith(b"PK"))
         self.assertGreater(len(blob), 1000)
+
+    def test_debris_report_option_and_incident_guard(self):
+        debris_payload = backend._kakao_report("▶ 개요: 폐그물 프로펠러 감김")
+        quick = debris_payload["template"]["quickReplies"]
+        self.assertIn("부유물 제거 보고서", [item["messageText"] for item in quick])
+        selection_card = debris_payload["template"]["outputs"][1]["textCard"]
+        self.assertEqual(selection_card["title"], "📋 보고서 서식 선택")
+        self.assertIn("부유물 제거 보고서", [button["messageText"] for button in selection_card["buttons"]])
+        self.assertEqual(len(backend._kakao_report("▶ 개요: 주기관 고장")["template"]["outputs"]), 1)
+        self.assertTrue(backend._is_debris_incident("우현 추진기에 이물질 유입"))
+        self.assertFalse(backend._is_debris_incident("주기관 고장으로 정선"))
+
+        uid = "non-debris-report-test"
+        backend._SESSIONS[uid] = {
+            "utterance": "시험호 주기관 고장", "report": "▶ 개요: 주기관 고장", "mode": None,
+        }
+        try:
+            response = backend.app.test_client().post("/kakao", json={
+                "userRequest": {"utterance": "부유물 제거 보고서", "user": {"id": uid}}
+            })
+            text = response.get_json()["template"]["outputs"][0]["simpleText"]["text"]
+            self.assertIn("부유물", text)
+            self.assertIn("사고에서 선택", text)
+        finally:
+            backend._SESSIONS.pop(uid, None)
+
+    def test_debris_report_composes_reference_sections(self):
+        data = {
+            "기준일시": "2026년 07월 14일 13:30", "보고센터": "제주운항관리센터",
+            "사고개요": "산타모니카호 추진기 이물질 제거 후 정상운항 재개",
+            "사고위치": "제주항 북동방 1.5마일", "현지기상": "풍향(ESE), 풍속(13m/s)",
+            "선명": "산타모니카호", "총톤수": "3,321톤", "선종": "쾌속카페리",
+            "승무정원": "11", "소유자": "씨월드고속훼리(주)",
+            "선박번호": "MPR-226204", "화물": "161.12 M/T", "선적항": "목포",
+            "국적": "대한민국", "검사기관": "KR",
+            "조치사항": ["VMS 모니터링 강화", "정상운항 재개"],
+        }
+        blob = backend._compose_debris_report_hwpx(data)
+        self.assertTrue(blob.startswith(b"PK"))
+        with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+            xml = "\n".join(
+                zf.read(name).decode("utf-8", "ignore")
+                for name in zf.namelist() if name.endswith(".xml")
+            )
+        for expected in ("붙임 2", "부유물 제거 조치사항", "부유물감김 조치사항 보고",
+                         "□ 개    요", "□ 선박제원", "□ 조치사항", "부유물 등 현장사진"):
+            self.assertIn(expected, xml)
+
+    def test_debris_endpoint_rejects_non_debris_and_unconfirmed_requests(self):
+        client = backend.app.test_client()
+        response = client.post("/report/debris-hwpx", json={"utterance": "시험호 기관 고장"})
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("부유물", response.get_json()["error"])
+
+        response = client.post("/report/debris-hwpx", json={"utterance": "시험호 폐그물 감김"})
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("사고 일시", response.get_json()["missing"])
+
+    def test_debris_confirmation_finishes_with_debris_template(self):
+        uid = "debris-confirmation-finish-test"
+        confirmed = {key: "값" for key in backend._REPORT_REQUIRED}
+        confirmed.update({"사고일시": "2026-07-14T13:24", "항로": "제주-진도",
+                          "출항시각": "13:20", "승무원": ""})
+        backend._SESSIONS[uid] = {
+            "utterance": "산타모니카호 폐그물 감김", "report": "▶ 조치사항: 이물질 제거",
+            "confirmed": confirmed, "pending_fields": ["승무원"],
+            "mode": "confirm_report_field", "report_kind": "debris",
+        }
+        payload = backend._kakao_text("전용 보고서 완료")
+        try:
+            with patch.object(backend, "_kakao_debris_hwpx_message", return_value=payload) as debris, \
+                 patch.object(backend, "_kakao_hwpx_message") as formal:
+                response = backend.app.test_client().post("/kakao", json={
+                    "userRequest": {"utterance": "11", "user": {"id": uid}}
+                })
+            self.assertEqual(response.get_json(), payload)
+            debris.assert_called_once()
+            formal.assert_not_called()
+            self.assertIsNone(backend._SESSIONS[uid]["report_kind"])
+        finally:
+            backend._SESSIONS.pop(uid, None)
 
 
 if __name__ == "__main__":

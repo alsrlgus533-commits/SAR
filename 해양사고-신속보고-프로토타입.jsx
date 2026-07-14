@@ -658,6 +658,7 @@ export default function App() {
   const [vesselList, setVesselList] = useState([]); // KOMSA 전체 선박(자동완성용)
   const [center, setCenter] = useState("운항관리센터"); // 보고 센터(정식 보고서 머리글)
   const [hwpxBusy, setHwpxBusy] = useState(false);
+  const [selectedReportKind, setSelectedReportKind] = useState("formal");
   const chatEnd = useRef(null);
 
   useEffect(() => { try { localStorage.setItem("sar_cfg", JSON.stringify(cfg)); } catch {} }, [cfg]);
@@ -688,6 +689,8 @@ export default function App() {
     .filter(([key]) => String(report[key] ?? "").trim() === "")
     .map(([, label]) => label) : [];
   if (report?.운항항로 && !/[-~∼↔]/.test(report.운항항로)) missingReportFields.push("운항 항로 형식(예: 목포-제주)");
+  const isDebrisIncident = !!report && /부유물|폐그물|폐로프|감김|감겨|이물질.*(?:추진기|프로펠러|스크류)|(?:추진기|프로펠러|스크류).*이물질/i
+    .test(`${report.원문 || ""} ${report.사고개요 || ""}`);
 
   const updateReportField = (key, value) => {
     setReviewed(false);
@@ -819,6 +822,7 @@ export default function App() {
       출항시각: resolvedDeparture(null, route),
     };
     setReport(draftReport);
+    setSelectedReportKind("formal");
     const draftMissing = requiredReportFields
       .filter(([key]) => String(draftReport[key] ?? "").trim() === "")
       .map(([, label]) => label);
@@ -833,17 +837,22 @@ export default function App() {
     setBusy(false);
   }
 
-  // ── 정식 해양사고 보고서(hwpx) 생성·다운로드 (backend.py /report/hwpx 경유) ──
-  async function downloadHwpx() {
+  // ── 정식/부유물 제거 조치사항 보고서(hwpx) 생성·다운로드 ──
+  async function downloadReportHwpx(kind = "formal") {
     if (!report || hwpxBusy) return;
+    const debris = kind === "debris";
     if (missingReportFields.length) {
-      setMsgs((m) => [...m, { who: "bot", text: `정식 보고서 생성 전 필수정보를 확인해 주세요: ${missingReportFields.join(", ")}` }]);
+      setMsgs((m) => [...m, { who: "bot", text: `${debris ? "부유물 제거 조치사항" : "정식"} 보고서 생성 전 필수정보를 확인해 주세요: ${missingReportFields.join(", ")}` }]);
+      return;
+    }
+    if (debris && !isDebrisIncident) {
+      setMsgs((m) => [...m, { who: "bot", text: "부유물 제거 조치사항 보고서는 부유물·폐그물 감김 또는 추진기 이물질 유입 사고에서 선택할 수 있습니다." }]);
       return;
     }
     setHwpxBusy(true);
     const base = (cfg.proxy || "http://localhost:8000").replace(/\/$/, "");
     try {
-      const res = await fetch(`${base}/report/hwpx`, {
+      const res = await fetch(`${base}${debris ? "/report/debris-hwpx" : "/report/hwpx"}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -870,19 +879,22 @@ export default function App() {
       const blob = await res.blob();
       const date = new Date();
       const ymd = `${date.getFullYear()}${String(date.getMonth() + 1).padStart(2, "0")}${String(date.getDate()).padStart(2, "0")}`;
-      const fname = `${report.선박명 || "해양사고"}_해양사고보고서_${ymd}.hwpx`;
+      const fname = `${report.선박명 || "해양사고"}_${debris ? "부유물제거조치사항" : "해양사고보고서"}_${ymd}.hwpx`;
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url; a.download = fname;
       document.body.appendChild(a); a.click(); a.remove();
       URL.revokeObjectURL(url);
-      setMsgs((m) => [...m, { who: "bot", text: `정식 해양사고 보고서(hwpx)를 생성해 다운로드했습니다 → ${fname} (한글에서 열어 검토·보완 후 본부 보고)` }]);
+      setMsgs((m) => [...m, { who: "bot", text: `${debris ? "부유물 제거 조치사항" : "정식 해양사고"} 보고서(hwpx)를 생성해 다운로드했습니다 → ${fname} (한글에서 열어 검토·보완 후 본부 보고)` }]);
     } catch (e) {
       setMsgs((m) => [...m, { who: "bot", text: `보고서(hwpx) 생성 실패: ${e.message} — backend.py 실행 여부와 pyhwpxlib 설치(pip install -r requirements.txt)를 확인하세요.` }]);
     } finally {
       setHwpxBusy(false);
     }
   }
+
+  const downloadHwpx = () => downloadReportHwpx("formal");
+  const downloadDebrisHwpx = () => downloadReportHwpx("debris");
 
   const S = styles;
   const steps = [
@@ -990,7 +1002,13 @@ export default function App() {
                   <div style={m.who === "user" ? S.bubbleUser : m.who === "api" ? { ...S.bubbleApi, ...(m.live === false ? S.bubbleApiFail : {}) } : S.bubbleBot}>
                     {m.who === "api" && <span style={{ ...S.apiTag, color: m.live === false ? "#C03221" : "#B07400" }}>{m.live === false ? "API 연결 실패 — 대체 데이터" : "API 실시간 연계"}</span>}
                     {m.text}
-                    {m.action && report && <button style={S.primaryBtn} onClick={() => setStep(2)}>1차 보고서 확인하기 →</button>}
+                    {m.action && report && <div style={{ display: "flex", gap: 7, flexWrap: "wrap", marginTop: 8 }}>
+                      <button style={S.primaryBtn} onClick={() => setStep(2)}>1차 보고서 확인하기 →</button>
+                      <button style={{ ...S.primaryBtn, background: "#0B5394" }}
+                        onClick={() => { setSelectedReportKind("formal"); setStep(3); }}>📄 정식 보고서 작성</button>
+                      {isDebrisIncident && <button style={{ ...S.primaryBtn, background: "#1B7F4E" }}
+                        onClick={() => { setSelectedReportKind("debris"); setStep(3); }}>🧹 부유물 제거 보고서 작성</button>}
+                    </div>}
                   </div>
                 </div>
               ))}
@@ -1055,6 +1073,15 @@ export default function App() {
           <section style={S.panel}>
             {sentFirst && <div style={S.sentBanner}>✓ 1차 속보 {sentFirst} 전파 완료 — 골든타임 확보, 아래 정식 보고서 보완 후 본부 보고</div>}
             <div style={S.panelHead}>③ 해양사고 보고서(최종·규정 서식) 자동 작성 → 운항관리자 검토·확인 후 본부 정식 보고</div>
+            <div style={{ ...S.reviewBox, borderColor: "#7B91AA", background: "#F7FAFD" }}>
+              <div style={{ fontWeight: 800, marginBottom: 8 }}>보고서 서식 선택</div>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <button style={{ ...S.primaryBtn, background: selectedReportKind === "formal" ? "#0B5394" : "#7B91AA" }}
+                  onClick={() => setSelectedReportKind("formal")}>📄 정식 보고서{selectedReportKind === "formal" ? " ✓" : ""}</button>
+                {isDebrisIncident && <button style={{ ...S.primaryBtn, background: selectedReportKind === "debris" ? "#1B7F4E" : "#7B91AA" }}
+                  onClick={() => setSelectedReportKind("debris")}>🧹 부유물 제거 보고서{selectedReportKind === "debris" ? " ✓" : ""}</button>}
+              </div>
+            </div>
             <table style={S.table}>
               <tbody>
                 <Row k="보고구분" v="최종 보고 (규정 서식)" />
@@ -1134,11 +1161,14 @@ export default function App() {
               <span style={{ ...S.formLabel, marginBottom: 0 }}>보고 센터</span>
               <input style={{ ...S.textarea, width: 220, padding: "8px 10px" }} value={center} disabled={!!sentFinal}
                 onChange={(e) => setCenter(e.target.value)} placeholder="예: 여수운항관리센터" />
-              <button style={{ ...S.primaryBtnLg, background: "#0B5394", padding: "10px 16px", opacity: hwpxBusy || missingReportFields.length ? 0.4 : 1 }}
-                disabled={hwpxBusy || missingReportFields.length > 0} onClick={downloadHwpx}>
-                {hwpxBusy ? "보고서 생성 중…" : "📄 정식 보고서(hwpx) 다운로드"}
+              <button style={{ ...S.primaryBtnLg, background: selectedReportKind === "debris" ? "#1B7F4E" : "#0B5394", padding: "10px 16px", opacity: hwpxBusy || missingReportFields.length ? 0.4 : 1 }}
+                disabled={hwpxBusy || missingReportFields.length > 0}
+                onClick={selectedReportKind === "debris" ? downloadDebrisHwpx : downloadHwpx}>
+                {hwpxBusy ? "보고서 생성 중…" : selectedReportKind === "debris"
+                  ? "🧹 부유물 제거 조치사항(hwpx) 다운로드"
+                  : "📄 정식 보고서(hwpx) 다운로드"}
               </button>
-              <span style={{ fontSize: 12, color: "#5A6B80" }}>공폼 서식 · 회사 선박마스터·기상·제원 자동 반영 · 한글에서 보완</span>
+              <span style={{ fontSize: 12, color: "#5A6B80" }}>보고서 서식 선택 · 회사 선박마스터·기상·제원 자동 반영 · 한글에서 보완</span>
             </div>
             {!sentFinal ? (
               <div style={S.sendArea}>

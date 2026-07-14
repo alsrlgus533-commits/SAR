@@ -1857,14 +1857,34 @@ _KAKAO_QUICK = [
     {"label": "✏️ 개요 수정", "action": "message", "messageText": "개요 수정"},
     {"label": "🛠️ 조치사항 수정", "action": "message", "messageText": "조치사항 수정"},
     {"label": "📄 정식 보고서(hwpx)", "action": "message", "messageText": "정식 보고서"},
+    {"label": "🧹 부유물 제거 보고서", "action": "message", "messageText": "부유물 제거 보고서"},
     {"label": "📤 관계기관 전송", "action": "message", "messageText": "관계기관 전송"},
 ]
 
 
+def _is_debris_incident(*texts: str) -> bool:
+    """부유물 감김·추진기 이물질 유입 사고인지 보수적으로 판별한다."""
+    blob = " ".join(str(text or "") for text in texts)
+    return bool(re.search(r"부유물|폐그물|폐로프|감김|감겨|이물질.*(?:추진기|프로펠러|스크류)|(?:추진기|프로펠러|스크류).*이물질",
+                          blob, re.I))
+
+
 def _kakao_report(text: str) -> dict:
     """보고서 simpleText + 하단 바로가기 버튼(개요·조치사항 수정·전송)."""
+    outputs = [{"simpleText": {"text": text}}]
+    # 콜백 응답에서 quickReplies가 접혀 보이는 카카오 클라이언트도 있어,
+    # 부유물 사고는 본문 바로 아래에 명시적인 서식 선택 카드를 함께 보낸다.
+    if _is_debris_incident(text):
+        outputs.append({"textCard": {
+            "title": "📋 보고서 서식 선택",
+            "description": "작성할 보고서 서식을 선택해 주세요.",
+            "buttons": [
+                {"action": "message", "label": "정식 보고서", "messageText": "정식 보고서"},
+                {"action": "message", "label": "부유물 제거 보고서", "messageText": "부유물 제거 보고서"},
+            ],
+        }})
     return {"version": "2.0", "template": {
-        "outputs": [{"simpleText": {"text": text}}],
+        "outputs": outputs,
         "quickReplies": _KAKAO_QUICK,
     }}
 
@@ -1888,7 +1908,7 @@ def _kakao_callback(callback_url: str, utterance: str, uid: str = "anon", prefix
     except Exception as exc:
         text = f"보고서 자동작성 중 오류가 발생했습니다: {exc}"
     _session_set(uid, report=text, utterance=utterance, accident_at=accident_at, mode=None,
-                 confirmed=None, pending_fields=[])  # 새 사고는 이전 확정값을 폐기
+                 confirmed=None, pending_fields=[], report_kind=None)  # 새 사고는 이전 확정값을 폐기
     _post_callback(callback_url, _kakao_report((prefix + text) if prefix else text))
 
 
@@ -1918,7 +1938,7 @@ def kakao_skill():
             "사고 내용을 한 문장으로 입력해 주세요.\n"
             "예) 섬사랑12호 추자도 북동방 2해리, 여객 28명 승무원 4명, 폐그물 감김"))
 
-    # 정식 보고서 필수정보를 한 항목씩 확인하는 대화 모드.
+    # 정식/부유물 제거 보고서 필수정보를 한 항목씩 확인하는 대화 모드.
     if sess.get("mode") == "confirm_report_field" and sess.get("pending_fields"):
         pending = list(sess["pending_fields"])
         key = pending[0]
@@ -1934,16 +1954,24 @@ def kakao_skill():
 
         src_utt = sess.get("utterance") or ""
         base = _public_base()
-        _session_set(uid, confirmed=confirmed, pending_fields=[], mode=None)
+        report_kind = sess.get("report_kind") or "formal"
+        _session_set(uid, confirmed=confirmed, pending_fields=[], mode=None, report_kind=None)
         if callback_url:
-            threading.Thread(target=_kakao_hwpx_callback,
-                             args=(callback_url, uid, src_utt, base, confirmed), daemon=True).start()
+            target = _kakao_debris_hwpx_callback if report_kind == "debris" else _kakao_hwpx_callback
+            args = ((callback_url, uid, src_utt, base, confirmed, sess.get("report") or "")
+                    if report_kind == "debris" else
+                    (callback_url, uid, src_utt, base, confirmed))
+            threading.Thread(target=target, args=args, daemon=True).start()
+            label = "부유물 제거 조치사항 보고서" if report_kind == "debris" else "정식 보고서"
             return jsonify({"version": "2.0", "useCallback": True,
-                            "data": {"text": "✅ 필수정보 확인 완료. 정식 보고서(hwpx)를 작성 중입니다…"}})
+                            "data": {"text": f"✅ 필수정보 확인 완료. {label}(hwpx)를 작성 중입니다…"}})
         try:
+            if report_kind == "debris":
+                return jsonify(_kakao_debris_hwpx_message(
+                    src_utt, base, confirmed=confirmed, first_report=sess.get("report") or ""))
             return jsonify(_kakao_hwpx_message(src_utt, base, confirmed=confirmed))
         except Exception as exc:
-            return jsonify(_kakao_text(f"정식 보고서(hwpx) 생성 중 오류가 발생했습니다: {exc}"))
+            return jsonify(_kakao_text(f"보고서(hwpx) 생성 중 오류가 발생했습니다: {exc}"))
 
     # ① [개요/조치사항 수정] — 버튼(키워드만) 또는 "개요 수정 <내용>" 한 줄 모두 처리
     _edit_m = re.match(r"^(개요|조치사항)\s*수정\s*(.*)$", utterance, re.S)
@@ -1998,12 +2026,40 @@ def kakao_skill():
         confirmed = _prepare_report_confirmation(src_utt, sess.get("report"), sess.get("confirmed"))
         pending = _pending_report_keys(confirmed)
         if pending:
-            _session_set(uid, confirmed=confirmed, pending_fields=pending, mode="confirm_report_field")
+            _session_set(uid, confirmed=confirmed, pending_fields=pending,
+                         mode="confirm_report_field", report_kind="formal")
             return jsonify(_kakao_text(_kakao_confirm_question(pending[0], len(pending))))
         try:
             return jsonify(_kakao_hwpx_message(src_utt, base, confirmed=confirmed))
         except Exception as exc:
             return jsonify(_kakao_text(f"정식 보고서(hwpx) 생성 중 오류가 발생했습니다: {exc}"))
+
+    # ②-c [부유물 제거 보고서] 버튼 → 산타모니카호 참고 서식의 전용 조치사항 보고서 생성
+    if utterance in ("부유물 제거 보고서", "부유물 제거 조치사항", "부유물 제거 조치사항 보고서"):
+        src_utt = sess.get("utterance")
+        first_report = sess.get("report") or ""
+        if not src_utt:
+            return jsonify(_kakao_text("먼저 사고 내용을 입력해 주세요. 1차 보고서를 만든 뒤 부유물 제거 조치사항 보고서를 받을 수 있습니다."))
+        if not _is_debris_incident(src_utt, first_report):
+            return jsonify(_kakao_text("부유물 제거 조치사항 보고서는 부유물·폐그물 감김 또는 추진기 이물질 유입 사고에서 선택할 수 있습니다."))
+        base = _public_base()
+        if callback_url:
+            threading.Thread(target=_kakao_prepare_debris_hwpx_callback,
+                             args=(callback_url, uid, src_utt, base, first_report,
+                                   sess.get("confirmed")), daemon=True).start()
+            return jsonify({"version": "2.0", "useCallback": True,
+                            "data": {"text": "📋 부유물 제거 조치사항 보고서 필수정보를 확인 중입니다… 잠시만 기다려 주세요."}})
+        confirmed = _prepare_report_confirmation(src_utt, first_report, sess.get("confirmed"))
+        pending = _pending_report_keys(confirmed)
+        if pending:
+            _session_set(uid, confirmed=confirmed, pending_fields=pending,
+                         mode="confirm_report_field", report_kind="debris")
+            return jsonify(_kakao_text(_kakao_confirm_question(pending[0], len(pending))))
+        try:
+            return jsonify(_kakao_debris_hwpx_message(
+                src_utt, base, confirmed=confirmed, first_report=first_report))
+        except Exception as exc:
+            return jsonify(_kakao_text(f"부유물 제거 조치사항 보고서(hwpx) 생성 중 오류가 발생했습니다: {exc}"))
 
     # ③ 수정 입력 모드 → LLM으로 항목 편집 후 보고서 재표출
     mode = sess.get("mode") or ""
@@ -2039,7 +2095,7 @@ def kakao_skill():
     # ④-a 콜백(비동기) 처리
     if callback_url:
         _session_set(uid, accident_at=kakao_received_at, mode=None,
-                     confirmed=None, pending_fields=[])
+                     confirmed=None, pending_fields=[], report_kind=None)
         threading.Thread(target=_kakao_callback,
                          args=(callback_url, utterance, uid, prefix, kakao_received_at), daemon=True).start()
         return jsonify({
@@ -2051,7 +2107,7 @@ def kakao_skill():
     try:
         text = _build_report_text(utterance, kakao_received_at)
         _session_set(uid, report=text, utterance=utterance, accident_at=kakao_received_at, mode=None,
-                     confirmed=None, pending_fields=[])
+                     confirmed=None, pending_fields=[], report_kind=None)
         return jsonify(_kakao_report(prefix + text if prefix else text))
     except Exception as exc:
         return jsonify(_kakao_text(f"보고서 자동작성 중 오류가 발생했습니다: {exc}"))
@@ -2632,6 +2688,16 @@ def _prepare_report_confirmation(utterance: str, first_report: str = "",
     return candidate
 
 
+def _report_lines(value) -> list:
+    """보고서 자유입력/LLM 결과를 빈 항목 없는 줄 목록으로 정규화한다."""
+    if isinstance(value, list):
+        items = value
+    else:
+        items = re.split(r"[\r\n]+|\s*/\s*", str(value or ""))
+    return [re.sub(r"^\s*[-•ㅇ]\s*", "", str(item)).strip()
+            for item in items if str(item).strip()]
+
+
 def _build_report_data(utterance: str, extra: dict = None, center: str = "", confirmed: dict = None) -> dict:
     """챗봇 입력 → 공폼 보고서용 데이터 dict 구성.
     사용자가 검토한 confirmed가 있으면 모든 자동추출·외부조회 값보다 우선한다."""
@@ -2641,6 +2707,10 @@ def _build_report_data(utterance: str, extra: dict = None, center: str = "", con
     if missing:
         raise ValueError("정식 보고서 필수정보 미확인: " + ", ".join(missing))
     parsed, inf = _parse_and_infer(utterance, extra)   # 파싱+공폼추정 1회 LLM 호출(2→1)
+    # 운항관리자가 직접 입력한 조치사항은 LLM 추정보다 우선한다.
+    direct_actions = _report_lines(extra.get("조치"))
+    if direct_actions:
+        inf["조치사항"] = direct_actions
     for key in ("사고일시", "선박명", "사고위치", "여객", "승무원", "사고개요"):
         if key in confirmed:
             parsed[key] = str(confirmed.get(key, "")).strip()
@@ -2771,6 +2841,12 @@ def _build_report_data(utterance: str, extra: dict = None, center: str = "", con
         "기준일시": now.strftime("%Y년 %m월 %d일 %H:%M"),
         "보고센터": center or "운항관리센터",
         "사고개요": narr,
+        "사고일시": accident_dt.strftime("%Y-%m-%d %H:%M") if accident_dt else "",
+        "사고위치": spot or loc,
+        "항로": route_nm,
+        "출항시각": dep,
+        "여객": pax_n,
+        "차량": str(veh_n or ""),
         "현지기상": weather,
         "선명": ship or ph,
         "총톤수": (vessel or {}).get("총톤수") or ph,
@@ -3015,6 +3091,88 @@ def _compose_report_hwpx(data: dict) -> bytes:
             pass
 
 
+def _compose_debris_report_hwpx(data: dict) -> bytes:
+    """'부유물 제거 조치사항(산타모니카호)260711.hwp' 형식의 전용 HWPX를 생성한다."""
+    from pyhwpxlib import HwpxBuilder
+
+    H1, H2 = 16, 12
+    b = HwpxBuilder()
+
+    # 참고 서식 상단 붙임 표: 붙임 번호와 문서명을 한 줄로 배치한다.
+    top_styles = {
+        (0, 0): {"text_color": "#FFFFFF", "bold": True},
+        (0, 1): {"text_color": "#000000", "bold": False},
+        (0, 2): {"text_color": "#000000", "bold": False},
+    }
+    b.add_table([["붙임 2", "", "부유물 제거 조치사항"]], header_bg="",
+                cell_colors={(0, 0): "#1769D2", (0, 1): "#FFFFFF", (0, 2): "#FFFFFF"},
+                cell_aligns={(0, 0): "CENTER", (0, 1): "CENTER", (0, 2): "LEFT"},
+                cell_styles=top_styles, col_widths=[6100, 800, 35620], row_heights=[2300],
+                page_break="NONE")
+    b.add_paragraph("")
+    ship = data.get("선명") or "○○호"
+    b.add_paragraph(f"({ship}) 부유물감김 조치사항 보고", bold=True,
+                    font_size=H1, alignment="CENTER")
+    b.add_paragraph(f"기준 일시 : {data.get('기준일시', '')}", alignment="RIGHT")
+    b.add_paragraph(f"보고 센터 : {data.get('보고센터', '운항관리센터')}", alignment="RIGHT")
+    b.add_paragraph("")
+
+    b.add_paragraph("□ 개    요", bold=True, font_size=H2)
+    b.add_table([[data.get("사고개요") or "[미확인]"]], header_bg="",
+                cell_colors={(0, 0): "#FFFFFF"}, cell_aligns={(0, 0): "LEFT"},
+                cell_styles={(0, 0): {"text_color": "#000000", "bold": False}},
+                row_heights=[4200], page_break="NONE")
+    b.add_paragraph(f"* 사고위치 : {data.get('사고위치') or '[미확인]'}")
+    b.add_paragraph(f"** 현지기상 : {data.get('현지기상') or '[미확인]'}")
+    b.add_paragraph("")
+
+    b.add_paragraph("□ 선박제원", bold=True, font_size=H2)
+    spec_rows = [
+        ["선 명", "총톤수", "선 종", "승선원", "소유자 또는\n선박회사"],
+        ["선박번호", "화물", "선적항", "국적", "검사기관"],
+        [data.get("선명", ""), data.get("총톤수", ""), data.get("선종", ""),
+         data.get("승무정원", ""), data.get("소유자", "")],
+        [data.get("선박번호", ""), data.get("화물", ""), data.get("선적항", ""),
+         data.get("국적", ""), data.get("검사기관", "")],
+    ]
+    cell_colors = {(r, c): ("#EFEFEF" if r in (0, 1) else "#FFFFFF")
+                   for r in range(4) for c in range(5)}
+    cell_styles = {(r, c): {"text_color": "#000000", "bold": r in (0, 1)}
+                   for r in range(4) for c in range(5)}
+    cell_aligns = {(r, c): "CENTER" for r in range(4) for c in range(5)}
+    b.add_table(spec_rows, header_bg="", cell_colors=cell_colors,
+                cell_styles=cell_styles, cell_aligns=cell_aligns,
+                col_widths=[7050, 7050, 7050, 7050, 14320],
+                row_heights=[1700, 1700, 2100, 2100], page_break="NONE")
+    b.add_paragraph("")
+
+    b.add_paragraph("□ 조치사항", bold=True, font_size=H2)
+    for action in _report_lines(data.get("조치사항")) or ["확인 중"]:
+        b.add_paragraph(f"  - {action}", alignment="LEFT")
+    b.add_paragraph("")
+
+    b.add_paragraph("□ 기타", bold=True, font_size=H2)
+    b.add_paragraph("  ㅇ 부유물 등 현장사진", alignment="LEFT")
+    b.add_table([["없음", ""]], header_bg="",
+                cell_colors={(0, 0): "#FFFFFF", (0, 1): "#FFFFFF"},
+                cell_aligns={(0, 0): "CENTER", (0, 1): "CENTER"},
+                cell_styles={(0, 0): {"text_color": "#000000", "bold": False},
+                             (0, 1): {"text_color": "#000000", "bold": False}},
+                col_widths=[21260, 21260], row_heights=[6500], page_break="NONE")
+
+    fd, path = tempfile.mkstemp(suffix=".hwpx")
+    os.close(fd)
+    try:
+        b.save(path)
+        with open(path, "rb") as f:
+            return f.read()
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 @app.post("/report/hwpx")
 def report_hwpx():
     """챗봇 데이터 → 정식 해양사고 보고서(hwpx) 다운로드.
@@ -3040,6 +3198,40 @@ def report_hwpx():
 
     kst = timezone(timedelta(hours=9))
     fname = (f"{data.get('선명') or '해양사고'}_해양사고보고서_"
+             f"{datetime.now(kst).strftime('%Y%m%d_%H%M')}.hwpx")
+    quoted = urllib.parse.quote(fname)
+    return Response(blob, mimetype="application/octet-stream", headers={
+        "Content-Disposition": f"attachment; filename*=UTF-8''{quoted}",
+        "Content-Length": str(len(blob)),
+    })
+
+
+@app.post("/report/debris-hwpx")
+def report_debris_hwpx():
+    """부유물 감김 사고 → '부유물 제거 조치사항' 전용 HWPX 다운로드."""
+    body = request.get_json(force=True, silent=True) or {}
+    utterance = str(body.get("utterance", "")).strip()
+    if not utterance:
+        return jsonify({"error": "utterance가 필요합니다"}), 400
+    if not _is_debris_incident(utterance, (body.get("confirmed") or {}).get("사고개요", "")):
+        return jsonify({"error": "부유물 감김·추진기 이물질 유입 사고에서만 작성할 수 있습니다."}), 422
+    center = str(body.get("center", "")).strip()
+    extra = body.get("extra") or {}
+    confirmed = body.get("confirmed") or {}
+    missing = _missing_report_fields(confirmed)
+    if missing:
+        return jsonify({"error": "필수정보를 확인·입력해 주세요.", "missing": missing}), 422
+    try:
+        data = _build_report_data(utterance, extra, center, confirmed)
+        blob = _compose_debris_report_hwpx(data)
+    except ImportError:
+        return jsonify({"error": "hwpx 생성 라이브러리(pyhwpxlib)가 없습니다. "
+                                 "pip install -r requirements.txt 후 다시 시도하세요."}), 503
+    except Exception as exc:
+        return jsonify({"error": f"부유물 제거 조치사항 보고서 생성 실패: {exc}"}), 500
+
+    kst = timezone(timedelta(hours=9))
+    fname = (f"{data.get('선명') or '해양사고'}_부유물제거조치사항_"
              f"{datetime.now(kst).strftime('%Y%m%d_%H%M')}.hwpx")
     quoted = urllib.parse.quote(fname)
     return Response(blob, mimetype="application/octet-stream", headers={
@@ -3123,6 +3315,34 @@ def _kakao_hwpx_message(utterance: str, base: str, center: str = "", confirmed: 
     }}
 
 
+def _kakao_debris_hwpx_message(utterance: str, base: str, center: str = "",
+                               confirmed: dict = None, first_report: str = "") -> dict:
+    """부유물 제거 조치사항 HWPX를 생성·보관하고 카카오 다운로드 카드를 반환한다."""
+    if not _is_debris_incident(utterance, first_report):
+        raise ValueError("부유물 감김·추진기 이물질 유입 사고가 아닙니다")
+    missing = _missing_report_fields(confirmed or {})
+    if missing:
+        raise ValueError("필수정보 미확인: " + ", ".join(missing))
+    action = _get_field(first_report, "조치사항")
+    data = _build_report_data(utterance, {"조치": action} if action else {}, center, confirmed)
+    blob = _compose_debris_report_hwpx(data)
+    kst = timezone(timedelta(hours=9))
+    fname = (f"{data.get('선명') or '해양사고'}_부유물제거조치사항_"
+             f"{datetime.now(kst).strftime('%Y%m%d_%H%M')}.hwpx")
+    token = _store_report_file(blob, fname)
+    url = f"{base}/report/download/{token}"
+    return {"version": "2.0", "template": {
+        "outputs": [{"textCard": {
+            "title": "🧹 부유물 제거 조치사항 보고서(hwpx)",
+            "description": (f"{data.get('선명') or ''} · 부유물 제거 조치사항 서식으로 작성했습니다.\n"
+                            "아래 버튼을 눌러 hwpx 파일을 받으세요.\n"
+                            "※ 한글에서 조치사항·현장사진을 확인·보완하세요. (링크 1시간 후 만료)"),
+            "buttons": [{"action": "webLink", "label": "보고서 다운로드", "webLinkUrl": url}],
+        }}],
+        "quickReplies": _KAKAO_QUICK,
+    }}
+
+
 def _kakao_hwpx_callback(callback_url: str, uid: str, utterance: str, base: str, confirmed: dict):
     """백그라운드: hwpx 생성·보관 후 다운로드 카드 콜백 전송."""
     try:
@@ -3131,6 +3351,19 @@ def _kakao_hwpx_callback(callback_url: str, uid: str, utterance: str, base: str,
         payload = _kakao_text("hwpx 생성 라이브러리(pyhwpxlib)가 서버에 설치되지 않았습니다. 관리자에게 문의해 주세요.")
     except Exception as exc:
         payload = _kakao_text(f"정식 보고서(hwpx) 생성 중 오류가 발생했습니다: {exc}")
+    _post_callback(callback_url, payload)
+
+
+def _kakao_debris_hwpx_callback(callback_url: str, uid: str, utterance: str, base: str,
+                                confirmed: dict, first_report: str = ""):
+    """백그라운드: 부유물 제거 조치사항 HWPX 다운로드 카드 콜백 전송."""
+    try:
+        payload = _kakao_debris_hwpx_message(
+            utterance, base, confirmed=confirmed, first_report=first_report)
+    except ImportError:
+        payload = _kakao_text("hwpx 생성 라이브러리(pyhwpxlib)가 서버에 설치되지 않았습니다. 관리자에게 문의해 주세요.")
+    except Exception as exc:
+        payload = _kakao_text(f"부유물 제거 조치사항 보고서(hwpx) 생성 중 오류가 발생했습니다: {exc}")
     _post_callback(callback_url, payload)
 
 
@@ -3147,15 +3380,37 @@ def _kakao_prepare_hwpx_callback(callback_url: str, uid: str, utterance: str,
         pending = _pending_report_keys(confirmed)
         if pending:
             _session_set(uid, confirmed=confirmed, pending_fields=pending,
-                         mode="confirm_report_field")
+                         mode="confirm_report_field", report_kind="formal")
             payload = _kakao_text(_kakao_confirm_question(pending[0], len(pending)))
         else:
-            _session_set(uid, confirmed=confirmed, pending_fields=[], mode=None)
+            _session_set(uid, confirmed=confirmed, pending_fields=[], mode=None, report_kind=None)
             payload = _kakao_hwpx_message(utterance, base, confirmed=confirmed)
     except ImportError:
         payload = _kakao_text("hwpx 생성 라이브러리(pyhwpxlib)가 서버에 설치되지 않았습니다. 관리자에게 문의해 주세요.")
     except Exception as exc:
         payload = _kakao_text(f"정식 보고서 준비 중 오류가 발생했습니다: {exc}")
+    _post_callback(callback_url, payload)
+
+
+def _kakao_prepare_debris_hwpx_callback(callback_url: str, uid: str, utterance: str,
+                                         base: str, first_report: str = "",
+                                         existing_confirmed: dict = None):
+    """부유물 제거 보고서의 준비·누락값 확인도 카카오 5초 제한 밖에서 처리한다."""
+    try:
+        confirmed = _prepare_report_confirmation(utterance, first_report, existing_confirmed)
+        pending = _pending_report_keys(confirmed)
+        if pending:
+            _session_set(uid, confirmed=confirmed, pending_fields=pending,
+                         mode="confirm_report_field", report_kind="debris")
+            payload = _kakao_text(_kakao_confirm_question(pending[0], len(pending)))
+        else:
+            _session_set(uid, confirmed=confirmed, pending_fields=[], mode=None, report_kind=None)
+            payload = _kakao_debris_hwpx_message(
+                utterance, base, confirmed=confirmed, first_report=first_report)
+    except ImportError:
+        payload = _kakao_text("hwpx 생성 라이브러리(pyhwpxlib)가 서버에 설치되지 않았습니다. 관리자에게 문의해 주세요.")
+    except Exception as exc:
+        payload = _kakao_text(f"부유물 제거 조치사항 보고서 준비 중 오류가 발생했습니다: {exc}")
     _post_callback(callback_url, payload)
 
 
