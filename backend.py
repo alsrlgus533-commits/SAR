@@ -2606,6 +2606,9 @@ _KAKAO_FIELD_ASK = {
 }
 
 _DEBRIS_REQUIRED = {
+    "대인": "대인 여객 수",
+    "소아": "소아 여객 수",
+    "차량": "차량 수",
     "유입상황": "감김·유입 부위와 상태",
     "제거조치": "부유물 제거 방법",
     "제거완료시각": "제거 완료 시각",
@@ -2613,6 +2616,9 @@ _DEBRIS_REQUIRED = {
 }
 
 _KAKAO_DEBRIS_ASK = {
+    "대인": "승선한 대인 여객 수를 숫자로 알려주세요.\n예) 138 (없으면 0)",
+    "소아": "승선한 소아 여객 수(소인·유아 합계)를 숫자로 알려주세요.\n예) 4 (없으면 0)",
+    "차량": "적재한 차량 수를 숫자로 알려주세요.\n예) 26 (없으면 0)",
     "유입상황": ("부유물이 감기거나 이물질이 유입된 정확한 부위와 상태를 알려주세요.\n"
                  "예) 우현 외측 4번 추진기에 이물질 유입"),
     "제거조치": ("부유물·이물질을 어떤 방법으로 제거했는지 알려주세요.\n"
@@ -2652,6 +2658,11 @@ def _normalize_confirm_answer(key: str, answer: str) -> str:
 
 def _normalize_debris_answer(key: str, answer: str) -> str:
     value = str(answer or "").strip()
+    if key in ("대인", "소아", "차량"):
+        if re.search(r"없(?:음|다)|해당\s*없", value):
+            return "0"
+        m = re.search(r"\d+", value)
+        return m.group(0) if m else ""
     if key == "제거완료시각":
         m = re.search(r"(?<!\d)([01]?\d|2[0-3])(?::|시\s*)([0-5]\d)(?:분)?", value)
         return f"{int(m.group(1)):02d}:{m.group(2)}" if m else ""
@@ -2662,6 +2673,21 @@ def _debris_confirmation_from_text(*texts: str) -> dict:
     """원문에 이미 명시된 제거 세부정보만 복원한다. 추정값은 만들지 않는다."""
     text = " ".join(str(x or "") for x in texts)
     out = {}
+    count_patterns = {
+        "대인": r"(?:대인|성인)\s*(\d+)\s*(?:명)?",
+        "소아": r"(?:소아)\s*(\d+)\s*(?:명)?",
+        "차량": r"차량\s*(\d+)\s*(?:대)?",
+    }
+    for key, pattern in count_patterns.items():
+        m = re.search(pattern, text)
+        if m:
+            out[key] = m.group(1)
+    if "소아" not in out:
+        child = re.search(r"소인\s*(\d+)\s*(?:명)?", text)
+        infant = re.search(r"유아\s*(\d+)\s*(?:명)?", text)
+        if child or infant:
+            out["소아"] = str(int(child.group(1) if child else 0)
+                            + int(infant.group(1) if infant else 0))
     incident_patterns = (
         r"((?:좌현|우현)?\s*(?:내측|외측)?\s*\d*번?\s*(?:추진기|프로펠러|스크류|워터제트)[^,.\n]{0,25}?(?:이물질|부유물|폐그물|폐로프)[^,.\n]{0,15}?(?:유입|감김|감겨))",
         r"((?:이물질|부유물|폐그물|폐로프)[^,.\n]{0,20}?(?:추진기|프로펠러|스크류|워터제트)[^,.\n]{0,15}?(?:유입|감김|감겨))",
@@ -2697,6 +2723,10 @@ def _prepare_debris_confirmation(utterance: str, first_report: str = "",
 def _pending_debris_keys(details: dict) -> list:
     d = details if isinstance(details, dict) else {}
     pending = [key for key in _DEBRIS_REQUIRED if not str(d.get(key, "")).strip()]
+    for key in ("대인", "소아", "차량"):
+        if d.get(key) is not None and str(d.get(key, "")).strip() and not str(d[key]).strip().isdigit():
+            if key not in pending:
+                pending.append(key)
     if d.get("제거완료시각") and not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", str(d["제거완료시각"]).strip()):
         if "제거완료시각" not in pending:
             pending.append("제거완료시각")
@@ -3084,6 +3114,14 @@ def _debris_summary_narrative(data: dict, details: dict) -> str:
 
 
 def _apply_debris_details(data: dict, details: dict) -> dict:
+    data["대인"] = str(details["대인"])
+    data["소인"] = str(details["소아"])
+    data["유아"] = "0"
+    data["차량"] = str(details["차량"])
+    try:
+        data["여객"] = str(int(data["대인"]) + int(data["소인"]))
+    except (TypeError, ValueError):
+        pass
     data["사고개요"] = _debris_summary_narrative(data, details)
     completed = str(details["제거완료시각"])
     data["조치사항"] = [

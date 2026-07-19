@@ -347,6 +347,7 @@ class ReportConfirmationTests(unittest.TestCase):
             "차량": "26",
         }
         details = {
+            "대인": "138", "소아": "4", "차량": "26",
             "유입상황": "우현 외측 4번 추진기에 이물질 유입",
             "제거조치": "기관 후진하여 이물질 제거",
             "제거완료시각": "15:37", "운항상태": "정상운항 재개",
@@ -376,8 +377,9 @@ class ReportConfirmationTests(unittest.TestCase):
                     "userRequest": {"utterance": "11", "user": {"id": uid}}
                 })
                 first_question = response.get_json()["template"]["outputs"][0]["simpleText"]["text"]
-                self.assertIn("정확한 부위와 상태", first_question)
-                for answer in ("우현 외측 4번 추진기에 이물질 유입",
+                self.assertIn("대인 여객 수", first_question)
+                for answer in ("138명", "4명", "26대",
+                               "우현 외측 4번 추진기에 이물질 유입",
                                "기관 후진하여 이물질 제거", "15:37"):
                     response = backend.app.test_client().post("/kakao", json={
                         "userRequest": {"utterance": answer, "user": {"id": uid}}
@@ -390,8 +392,19 @@ class ReportConfirmationTests(unittest.TestCase):
             formal.assert_not_called()
             self.assertIsNone(backend._SESSIONS[uid]["report_kind"])
             self.assertEqual(backend._SESSIONS[uid]["debris_confirmed"]["제거완료시각"], "15:37")
+            self.assertEqual(backend._SESSIONS[uid]["debris_confirmed"]["차량"], "26")
         finally:
             backend._SESSIONS.pop(uid, None)
+
+    def test_debris_confirmation_reuses_manifest_counts_from_accident_text(self):
+        details = backend._prepare_debris_confirmation(
+            "산타모니카호 대인 138명 소인 3명 유아 1명 차량 26대, "
+            "우현 외측 4번 추진기에 이물질 유입되어 기관 후진하여 이물질 제거 후 "
+            "15:37경 정상운항 재개")
+        self.assertEqual(details["대인"], "138")
+        self.assertEqual(details["소아"], "4")
+        self.assertEqual(details["차량"], "26")
+        self.assertEqual(backend._pending_debris_keys(details), [])
 
 
 if __name__ == "__main__":
