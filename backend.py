@@ -3164,6 +3164,32 @@ def _img_size(path: str):
     return 0, 0
 
 
+def _zero_para_top_spacing(hwpx_path: str) -> None:
+    """저장된 hwpx의 문단 '위 간격'을 전부 0으로 보정. 실패 시 조용히 통과.
+    pyhwpxlib 빈문서 서식의 paraPr id 12(왼쪽정렬)가 위 간격 2400(=24pt)을 갖는데,
+    스타일 재사용 매칭(ensure_para_style)이 위/아래 간격을 비교하지 않아
+    alignment="LEFT" 문단이 이 서식을 그대로 물려받음 → header.xml의 hc:prev 값을 0으로."""
+    import re
+    import zipfile
+    try:
+        with zipfile.ZipFile(hwpx_path, "r") as zin:
+            entries = {n: zin.read(n) for n in zin.namelist()}
+        hdr = "Contents/header.xml"
+        if hdr not in entries:
+            return
+        fixed = re.sub(rb'(<hc:prev\b[^>]*\bvalue=")\d+(")', rb"\g<1>0\g<2>", entries[hdr])
+        if fixed == entries[hdr]:
+            return
+        entries[hdr] = fixed
+        with zipfile.ZipFile(hwpx_path, "w", zipfile.ZIP_DEFLATED) as zout:
+            if "mimetype" in entries:    # hwpx 규약: mimetype 먼저·무압축
+                zout.writestr("mimetype", entries.pop("mimetype"), zipfile.ZIP_STORED)
+            for n, d in entries.items():
+                zout.writestr(n, d)
+    except Exception as exc:
+        print(f"[report] 문단 위 간격 보정 실패: {exc}", flush=True)
+
+
 def _postprocess_report_hwpx(hwpx_path: str) -> None:
     """저장된 hwpx를 공폼 서식에 맞게 XML 후처리(pyhwpxlib 미지원 항목 보정). 실패 시 조용히 통과.
     ① 결재 박스 표를 상단 우측 정렬(공폼처럼) — 우측정렬 문단(기준 일시)의 paraPrIDRef 재사용
@@ -3341,6 +3367,7 @@ def _compose_report_hwpx(data: dict) -> bytes:
     os.close(fd)
     try:
         b.save(path)
+        _zero_para_top_spacing(path)             # 문단 위 간격 24pt(라이브러리 기본 서식) → 0
         _postprocess_report_hwpx(path)           # 결재 박스 우측정렬 + 사진을 선박제원 표 셀로 이동(공폼식)
         with open(path, "rb") as f:
             return f.read()
@@ -3424,6 +3451,7 @@ def _compose_debris_report_hwpx(data: dict) -> bytes:
     os.close(fd)
     try:
         b.save(path)
+        _zero_para_top_spacing(path)             # 문단 위 간격 24pt(라이브러리 기본 서식) → 0
         with open(path, "rb") as f:
             return f.read()
     finally:
