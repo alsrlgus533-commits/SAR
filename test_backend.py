@@ -396,6 +396,28 @@ class ReportConfirmationTests(unittest.TestCase):
         finally:
             backend._SESSIONS.pop(uid, None)
 
+    def test_weather_missing_values_filled_from_nearby_stations(self):
+        # 주 지점(최근접 파고부이)이 전부 결측(-9) → 인근 해양기상부이 값으로 보충돼야 한다
+        sea_csv = (
+            "C,202607191000,22101,근접파고부이,126.00,34.05,-9,-9,-9,-9,-9,-9,-9,-9\n"
+            "B,202607191000,22102,인근해양부이,126.00,34.30,1.5,180,8.0,10.0,22.0,20.0,1013,80\n"
+        )
+        cache_backup = dict(backend._SEA_OBS_CACHE)
+        try:
+            with patch.object(backend, "KMA_KEY", "test-key"), \
+                 patch.object(backend, "http_get", return_value=sea_csv), \
+                 patch.object(backend, "_nearest_aws", return_value=None):
+                wx = backend._weather_lookup("", "34.0", "126.0")
+            self.assertTrue(wx["지점"].startswith("근접파고부이"))
+            self.assertEqual(wx["파고"], "1.5m")
+            self.assertEqual(wx["풍속"], "8.0m/s")
+            self.assertEqual(wx["수온"], "22.0℃")
+            self.assertNotEqual(wx["풍향"], "결측")
+            for key in ("파고출처", "풍향풍속출처", "수온출처"):
+                self.assertIn("인근해양부이", wx[key])
+        finally:
+            backend._SEA_OBS_CACHE.update(cache_backup)
+
     def test_debris_confirmation_reuses_manifest_counts_from_accident_text(self):
         details = backend._prepare_debris_confirmation(
             "산타모니카호 대인 138명 소인 3명 유아 1명 차량 26대, "

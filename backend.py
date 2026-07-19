@@ -520,23 +520,47 @@ def _weather_lookup(loc: str, lat: str = "", lon: str = "") -> dict:
     if row is None:
         return {"error": "사고위치로 인근 관측소를 특정하지 못했습니다 (좌표 또는 지명 필요)", "_status": 422}
 
-    # ── 3) 파고 보충: 주 지점 파고가 결측이면 가장 가까운 파고부이(C, 없으면 B)의 파고로 채운다 ──
-    wh = row["wh"]
-    wh_src = None
-    if wh is None and plat is not None and plon is not None:
-        for pref in (("C",), ("B",)):
-            pool = [
-                r for r in coord_rows
-                if r["tp"] in pref and r["wh"] is not None and r is not row
-            ]
-            if pool:
-                wsrc = min(pool, key=lambda r: _haversine_nm(plat, plon, r["lat"], r["lon"]))
-                wh = wsrc["wh"]
-                wh_src = f"{wsrc['name']} {_TP_LABELS.get(wsrc['tp'], wsrc['tp'])}"
-                break
+    # ── 3) 결측 보충: 주 지점에 없는 값은 그 값이 있는 최근접 다른 관측소로 채운다 ──
+    def _nearest_with(keys, types=None):
+        """keys 값이 모두 있는 최근접 관측소(주 지점 제외)와 거리(해리). 없으면 None."""
+        if plat is None or plon is None:
+            return None
+        pool = [r for r in coord_rows
+                if r is not row and (types is None or r["tp"] in types)
+                and all(r[k] is not None for k in keys)]
+        if not pool:
+            return None
+        src = min(pool, key=lambda r: _haversine_nm(plat, plon, r["lat"], r["lon"]))
+        return src, _haversine_nm(plat, plon, src["lat"], src["lon"])
 
-    wd_txt = "결측" if row["wd"] is None else _DIRS[round(row["wd"] / 22.5) % 16]
-    ws_txt = "결측" if row["ws"] is None else f"{row['ws']}m/s"
+    def _src_label(src, d):
+        return f"{src['name']} {_TP_LABELS.get(src['tp'], src['tp'])}, 약 {round(d)}해리"
+
+    # 파고: 파고부이(C) → 해양기상부이(B) → 그 외 관측소 순으로 최근접 보충
+    wh, wh_src = row["wh"], None
+    if wh is None:
+        found = (_nearest_with(("wh",), ("C",)) or _nearest_with(("wh",), ("B",))
+                 or _nearest_with(("wh",)))
+        if found:
+            wh, wh_src = found[0]["wh"], _src_label(*found)
+
+    # 풍향·풍속: 한쪽이라도 결측이면 두 값이 모두 있는 최근접 관측소 값으로 통째 대체
+    # (풍향·풍속을 서로 다른 지점에서 섞으면 출처가 왜곡되므로 쌍으로 취급)
+    wd, ws, wind_src = row["wd"], row["ws"], None
+    if wd is None or ws is None:
+        found = _nearest_with(("wd", "ws"))
+        if found:
+            wd, ws, wind_src = found[0]["wd"], found[0]["ws"], _src_label(*found)
+
+    # 수온: 결측이면 수온이 있는 최근접 관측소로 보충
+    tw, tw_src = row["tw"], None
+    if tw is None:
+        found = _nearest_with(("tw",))
+        if found:
+            tw, tw_src = found[0]["tw"], _src_label(*found)
+
+    wd_txt = "결측" if wd is None else _DIRS[round(wd / 22.5) % 16]
+    ws_txt = "결측" if ws is None else f"{ws}m/s"
 
     label = f"{row['name']}({_TP_LABELS.get(row['tp'], row['tp'])}"
     label += f", 약 {round(dist_nm)}해리)" if dist_nm is not None else ")"
@@ -545,12 +569,14 @@ def _weather_lookup(loc: str, lat: str = "", lon: str = "") -> dict:
         "풍향": wd_txt,
         "풍속": ws_txt,
         "파고": "결측" if wh is None else f"{wh}m",
-        "수온": "결측" if row["tw"] is None else f"{row['tw']}℃",
+        "수온": "결측" if tw is None else f"{tw}℃",
         "관측시각": row["tm"] if row["tm"] is not None else "결측",
-        "풍향풍속출처": row["name"],
+        "풍향풍속출처": wind_src or row["name"],
     }
     if wh_src is not None:
         resp["파고출처"] = wh_src
+    if tw_src is not None:
+        resp["수온출처"] = tw_src
     if stale:
         resp["_stale"] = True
 
@@ -1710,8 +1736,15 @@ def _build_report_text(utterance: str, kakao_received_at: str = "") -> str:
 
     # 기상 줄 (위치 바로 아래에 배치) — 가장 가까운 1개로 통합 (파고·수온은 부이, 기온은 인근 AWS)
     if wx:
-        parts = [f"풍향 {wx.get('풍향')}", f"풍속 {wx.get('풍속')}",
-                 f"파고 {wx.get('파고')}", f"수온 {wx.get('수온')}"]
+        # 주 지점 결측을 다른 관측소로 보충한 값은 출처를 괄호로 병기
+        wsrc = str(wx.get("풍향풍속출처") or "")
+        wind_note = (f"({wsrc})" if wsrc
+                     and not str(wx.get("지점", "")).startswith(wsrc) else "")
+        parts = [f"풍향 {wx.get('풍향')}", f"풍속 {wx.get('풍속')}{wind_note}",
+                 f"파고 {wx.get('파고')}"
+                 + (f"({wx['파고출처']})" if wx.get("파고출처") else ""),
+                 f"수온 {wx.get('수온')}"
+                 + (f"({wx['수온출처']})" if wx.get("수온출처") else "")]
         a = wx.get("AWS")
         if a and a.get("기온"):
             parts.append(f"기온 {a.get('기온')}")
